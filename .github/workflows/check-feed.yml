@@ -1,4 +1,4 @@
-name: Check NSE Feed
+name: Check Free Sources
 
 on:
   workflow_dispatch:
@@ -11,41 +11,78 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - name: Fetch official announcements
+      - name: Test Screener and ScanX
         shell: bash
         run: |
           python - <<'PY'
           import urllib.request
-          import xml.etree.ElementTree as ET
+          import re
+          import html
 
-          urls = [
-              "https://nsearchives.nseindia.com/content/RSS/Online_announcements.xml",
-              "https://archives.nseindia.com/content/RSS/Online_announcements.xml",
+          sources = [
+              ("Screener", "https://www.screener.in/company/HFCL/consolidated/"),
+              ("ScanX", "https://scanx.trade/stock-market-news/orders-deals"),
           ]
 
-          success = False
+          passed = 0
 
-          for url in urls:
-              print("Checking:", url, flush=True)
+          for name, url in sources:
+              print("\nSOURCE:", name, flush=True)
               try:
-                  with urllib.request.urlopen(url, timeout=25) as response:
-                      root = ET.fromstring(response.read())
+                  request = urllib.request.Request(
+                      url,
+                      headers={"User-Agent": "Mozilla/5.0"}
+                  )
+                  with urllib.request.urlopen(request, timeout=25) as response:
+                      page = response.read().decode("utf-8", errors="replace")
+                      print("HTTP:", response.status)
 
-                  items = root.findall("./channel/item")
-                  if not items:
-                      raise ValueError("No announcements found")
+                  if name == "Screener":
+                      section = re.search(
+                          r'<section\b[^>]*id=["\x27]quarters["\x27][^>]*>(.*?)</section>',
+                          page, re.S | re.I
+                      )
+                      if not section:
+                          raise ValueError("Quarterly results table not found")
 
-                  print("SUCCESS! Announcements:", len(items))
-                  for item in items[:3]:
-                      print("Company:", item.findtext("title"))
-                      print("Details:", item.findtext("description"))
-                      print("Link:", item.findtext("link"))
+                      rows = re.findall(
+                          r"<tr\b[^>]*>(.*?)</tr>",
+                          section.group(1), re.S | re.I
+                      )
+                      if not rows:
+                          raise ValueError("Result rows missing")
 
-                  success = True
-                  break
+                      for row in rows[:6]:
+                          text = re.sub(r"<[^>]+>", " ", row)
+                          print(html.unescape(" ".join(text.split())))
+
+                      print("PASS: Quarterly result rows accessible")
+
+                  else:
+                      links = re.findall(
+                          r'href=["\x27]([^"\x27]+)["\x27]',
+                          page, re.I
+                      )
+                      articles = list(dict.fromkeys(
+                          link for link in links
+                          if "/stock-market-news/" in link
+                          and len(link.split("/")) >= 5
+                      ))
+                      if not articles:
+                          raise ValueError("Article links not found")
+
+                      print("Article links found:", len(articles))
+                      for link in articles[:5]:
+                          print(html.unescape(link))
+
+                      print("PASS: News links accessible")
+
+                  passed += 1
+
               except Exception as error:
-                  print("Failed:", type(error).__name__, str(error))
+                  print("FAIL:", type(error).__name__, str(error))
 
-          if not success:
-              raise SystemExit("NSE feed could not be fetched")
+          print("\nSources passed:", passed, "of", len(sources))
+          if passed != len(sources):
+              raise SystemExit(1)
           PY

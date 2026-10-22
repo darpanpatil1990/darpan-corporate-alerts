@@ -1,4 +1,4 @@
-name: Test Telegram Results
+name: Check Screener Login
 
 on:
   workflow_dispatch:
@@ -7,166 +7,57 @@ permissions:
   contents: read
 
 jobs:
-  results:
+  login:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - name: Send HFCL quarterly results
+      - name: Check announcements access
         env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
+          SCREENER_EMAIL: ${{ secrets.SCREENER_EMAIL }}
+          SCREENER_PASSWORD: ${{ secrets.SCREENER_PASSWORD }}
         shell: bash
         run: |
           python - <<'PY'
           import os
-          import re
-          import html
-          import json
+          import http.cookiejar
           import urllib.request
+          import urllib.parse
           import urllib.error
-          from datetime import datetime
+          from html.parser import HTMLParser
 
-          token = os.environ.get("BOT_TOKEN", "").strip()
-          chat_id = os.environ.get("CHAT_ID", "").strip()
+          class PageParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.csrf = ""
+                  self.links = []
+                  self.current = None
 
-          if not token or not chat_id:
-              raise SystemExit("BOT_TOKEN or CHAT_ID secret missing")
+              def handle_starttag(self, tag, attrs):
+                  attrs = dict(attrs)
+                  if tag == "input":
+                      if attrs.get("name") == "csrfmiddlewaretoken":
+                          self.csrf = attrs.get("value", "")
+                  if tag == "a":
+                      self.current = [attrs.get("href", ""), ""]
 
-          url = "https://www.screener.in/company/HFCL/consolidated/"
-          request = urllib.request.Request(
-              url, headers={"User-Agent": "Mozilla/5.0"}
+              def handle_data(self, data):
+                  if self.current is not None:
+                      self.current[1] += data
+
+              def handle_endtag(self, tag):
+                  if tag == "a" and self.current is not None:
+                      self.links.append(self.current)
+                      self.current = None
+
+          email = os.environ.get("SCREENER_EMAIL", "").strip()
+          password = os.environ.get("SCREENER_PASSWORD", "")
+
+          if not email or not password:
+              raise SystemExit("Screener secrets missing")
+
+          cookies = http.cookiejar.CookieJar()
+          client = urllib.request.build_opener(
+              urllib.request.HTTPCookieProcessor(cookies)
           )
-
-          try:
-              with urllib.request.urlopen(request, timeout=25) as response:
-                  page = response.read().decode("utf-8")
-          except Exception:
-              raise SystemExit("Screener fetch failed")
-
-          section = re.search(
-              r'<section\b[^>]*id=["\x27]quarters["\x27][^>]*>(.*?)</section>',
-              page, re.S | re.I
-          )
-          if not section:
-              raise SystemExit("Quarterly table missing")
-
-          rows = []
-          for row in re.findall(
-              r"<tr\b[^>]*>(.*?)</tr>",
-              section.group(1), re.S | re.I
-          ):
-              cells = re.findall(
-                  r"<t[dh]\b[^>]*>(.*?)</t[dh]>",
-                  row, re.S | re.I
-              )
-              rows.append([
-                  " ".join(html.unescape(
-                      re.sub(r"<[^>]+>", " ", cell)
-                  ).split())
-                  for cell in cells
-              ])
-
-          headers = rows[0]
-          periods = {}
-          for index, label in enumerate(headers):
-              try:
-                  date = datetime.strptime(label, "%b %Y")
-                  periods[date.year * 12 + date.month] = index
-              except ValueError:
-                  pass
-
-          if not periods:
-              raise SystemExit("Quarter dates missing")
-
-          latest = max(periods)
-          if latest - 3 not in periods or latest - 12 not in periods:
-              raise SystemExit("Comparable quarters missing")
-
-          now_i = periods[latest]
-          qoq_i = periods[latest - 3]
-          yoy_i = periods[latest - 12]
-
-          def find_row(label):
-              for row in rows[1:]:
-                  if row and row[0].replace("+", "").strip() == label:
-                      return row
-              raise ValueError("Missing row: " + label)
-
-          def number(value):
-              return float(value.replace(",", "").replace("%", ""))
-
-          def growth(current, previous):
-              if previous <= 0:
-                  return "N/A (previous value zero/negative)"
-              return f"{(current / previous - 1) * 100:+.2f}%"
-
-          lines = [
-              "🧪 TEST — HFCL Quarterly Results",
-              "Quarter: " + headers[now_i],
-              "Basis: Consolidated | Amounts: ₹ crore",
-              "YoY: " + headers[yoy_i] + " | QoQ: " + headers[qoq_i],
-          ]
-
-          metrics = [
-              ("Sales", "Revenue", "₹", " Cr"),
-              ("Operating Profit", "Operating Profit", "₹", " Cr"),
-              ("Profit before tax", "PBT", "₹", " Cr"),
-              ("Net Profit", "Net Profit", "₹", " Cr"),
-              ("EPS in Rs", "EPS", "₹", ""),
-          ]
-
-          for key, label, prefix, suffix in metrics:
-              row = find_row(key)
-              current = number(row[now_i])
-              yearly = number(row[yoy_i])
-              quarterly = number(row[qoq_i])
-              lines.append(
-                  f"{label}: {prefix}{current:g}{suffix}\n"
-                  f"Previous year: {yearly:g} | Previous quarter: {quarterly:g}\n"
-                  f"YoY {growth(current, yearly)} | QoQ {growth(current, quarterly)}"
-              )
-
-          margin = find_row("OPM %")
-          lines.append(
-              f"Operating Margin: {margin[now_i]}\n"
-              f"Previous year: {margin[yoy_i]} | Previous quarter: {margin[qoq_i]}"
-          )
-
-          other = find_row("Other Income")
-          lines.append(
-              f"Other Income: ₹{other[now_i]} Cr\n"
-              f"Previous year: ₹{other[yoy_i]} Cr | Previous quarter: ₹{other[qoq_i]} Cr"
-          )
-
-          lines.extend([
-              "Source: Screener. Growth calculated from displayed figures; rounding may affect percentages.",
-              url,
-          ])
-
-          message = "\n\n".join(lines)
-          payload = json.dumps({
-              "chat_id": chat_id,
-              "text": message,
-              "link_preview_options": {"is_disabled": True},
-          }).encode()
-
-          telegram = urllib.request.Request(
-              "https://api.telegram.org/bot" + token + "/sendMessage",
-              data=payload,
-              headers={"Content-Type": "application/json"},
-              method="POST",
-          )
-
-          try:
-              with urllib.request.urlopen(telegram, timeout=25) as response:
-                  result = json.load(response)
-          except urllib.error.HTTPError as error:
-              raise SystemExit("Telegram HTTP error: " + str(error.code))
-          except Exception:
-              raise SystemExit("Telegram connection failed")
-
-          if not result.get("ok"):
-              raise SystemExit("Telegram rejected the message")
-
-          print("SUCCESS: HFCL result sent to Telegram")
-          PY
+          client.addheaders = [
+              ("User-Agent

@@ -1,0 +1,51 @@
+name: Check NSE Feed
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Fetch official announcements
+        shell: bash
+        run: |
+          python - <<'PY'
+          import urllib.request
+          import xml.etree.ElementTree as ET
+
+          urls = [
+              "https://nsearchives.nseindia.com/content/RSS/Online_announcements.xml",
+              "https://archives.nseindia.com/content/RSS/Online_announcements.xml",
+          ]
+
+          success = False
+
+          for url in urls:
+              print("Checking:", url, flush=True)
+              try:
+                  with urllib.request.urlopen(url, timeout=25) as response:
+                      root = ET.fromstring(response.read())
+
+                  items = root.findall("./channel/item")
+                  if not items:
+                      raise ValueError("No announcements found")
+
+                  print("SUCCESS! Announcements:", len(items))
+                  for item in items[:3]:
+                      print("Company:", item.findtext("title"))
+                      print("Details:", item.findtext("description"))
+                      print("Link:", item.findtext("link"))
+
+                  success = True
+                  break
+              except Exception as error:
+                  print("Failed:", type(error).__name__, str(error))
+
+          if not success:
+              raise SystemExit("NSE feed could not be fetched")
+          PY

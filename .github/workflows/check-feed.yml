@@ -1,11 +1,8 @@
 name: Check Screener Login
-
 on:
   workflow_dispatch:
-
 permissions:
   contents: read
-
 jobs:
   login:
     runs-on: ubuntu-latest
@@ -15,57 +12,29 @@ jobs:
         env:
           SCREENER_EMAIL: ${{ secrets.SCREENER_EMAIL }}
           SCREENER_PASSWORD: ${{ secrets.SCREENER_PASSWORD }}
+        shell: python
         run: |
-          python - <<'PY'
           import os, re, http.cookiejar
-          import urllib.request as web
-          import urllib.parse as parse
-
-          email = os.environ.get("SCREENER_EMAIL", "").strip()
-          password = os.environ.get("SCREENER_PASSWORD", "")
-          if not email or not password:
-              raise SystemExit("Screener secrets missing")
-
-          jar = http.cookiejar.CookieJar()
-          client = web.build_opener(web.HTTPCookieProcessor(jar))
-          client.addheaders = [("User-Agent", "Mozilla/5.0")]
+          import urllib.request as w
+          import urllib.parse as p
+          email = os.environ["SCREENER_EMAIL"].strip()
+          password = os.environ["SCREENER_PASSWORD"]
+          assert email and password, "Screener secrets missing"
           base = "https://www.screener.in"
-          stage = "Open login page"
-
-          try:
-              with client.open(base + "/login/", timeout=25) as r:
-                  page = r.read().decode()
-
-              csrf = re.search(
-                  r'name="csrfmiddlewaretoken"\s+value="([^"]+)"',
-                  page
-              )
-              if not csrf:
-                  raise SystemExit("Login form token missing")
-
-              data = parse.urlencode({
-                  "username": email,
-                  "password": password,
-                  "csrfmiddlewaretoken": csrf.group(1),
-                  "next": "/announcements/"
-              }).encode()
-
-              stage = "Submit login"
-              req = web.Request(
-                  base + "/login/", data=data,
-                  headers={"Referer": base + "/login/"}
-              )
-              with client.open(req, timeout=25) as r:
-                  r.read()
-
-              stage = "Open announcements"
-              with client.open(base + "/announcements/", timeout=25) as r:
-                  path = parse.urlparse(r.url).path
-                  page = r.read().decode()
-
-              if path != "/announcements/":
-                  raise SystemExit("Login not confirmed: check credentials or website verification")
-              if "Latest Announcements" not in page:
-                  raise SystemExit("Announcements content not confirmed")
-
-              print("SUCCESS: Login and Announcements access confirmed")
+          client = w.build_opener(w.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+          client.addheaders = [("User-Agent", "Mozilla/5.0")]
+          with client.open(base + "/login/", timeout=25) as r:
+              page = r.read().decode()
+          token = re.search(r'name="csrfmiddlewaretoken"\s+value="([^"]+)"', page)
+          assert token, "Login form token missing"
+          data = p.urlencode({"username": email, "password": password, "csrfmiddlewaretoken": token.group(1), "next": "/announcements/"}).encode()
+          request = w.Request(base + "/login/", data=data, headers={"Referer": base + "/login/"})
+          with client.open(request, timeout=25) as r:
+              r.read()
+          with client.open(base + "/announcements/", timeout=25) as r:
+              path = p.urlparse(r.url).path
+              page = r.read().decode()
+          assert path == "/announcements/", "Login not confirmed"
+          assert "Latest Announcements" in page, "Announcements not confirmed"
+          print("SUCCESS: Screener login and announcements work")
+# END

@@ -24,121 +24,353 @@ jobs:
         CHAT_ID: ${{ secrets.CHAT_ID }}
         GH_TOKEN: ${{ github.token }}
       shell: python
-      run: "\"\"\"Monitor accessible Screener announcement cards; secrets come only from env.\"\"\"\nimport base64\nimport\
-        \ hashlib\nimport http.cookiejar\nimport json\nimport os\nimport re\nimport time\nimport urllib.error\nimport urllib.parse\
-        \ as url\nimport urllib.request as web\nfrom datetime import datetime, timezone\nfrom bs4 import BeautifulSoup\n\n\
-        BASE = 'https://www.screener.in'\nMAX_PAGES = 5\nMAX_SEND = 25\nSTATE_PATH = 'corporate-alert-state.json'\n\n\ndef\
-        \ digest(value):\n    return hashlib.sha256(value.encode()).hexdigest()\n\n\ndef cards(page):\n    soup = BeautifulSoup(page,\
-        \ 'html.parser')\n    found, seen = [], set()\n    for anchor in soup.select('a[href]'):\n        href = url.urljoin(BASE,\
-        \ anchor['href'])\n        host = (url.urlparse(href).hostname or '').lower()\n        allowed = ('bseindia.com',\
-        \ 'nseindia.com', 'screener.in')\n        if not any(host == d or host.endswith('.' + d) for d in allowed):\n    \
-        \        continue\n        if not ('.pdf' in href.lower() or 'downloadattach' in href.lower()):\n            continue\n\
-        \        for parent in anchor.parents:\n            if parent.name in ('body', 'html'):\n                break\n \
-        \           companies = parent.select('a[href*=\"/company/\"]')\n            if len(companies) > 1:\n            \
-        \    break\n            if not companies:\n                continue\n            company = companies[0]\n        \
-        \    name = company.get_text(' ', strip=True)\n            text = parent.get_text(' ', strip=True)\n            title\
-        \ = anchor.get_text(' ', strip=True)\n            if not name or not title or len(text) > 3500:\n                break\n\
-        \            identity = digest(name + '|' + href)\n            if identity not in seen:\n                seen.add(identity)\n\
-        \                found.append({'id': identity, 'name': name, 'title': title,\n                              'text':\
-        \ text, 'link': href,\n                              'company': url.urljoin(BASE, company['href'])})\n           \
-        \ break\n    return found\n\n\ndef next_page(page):\n    soup = BeautifulSoup(page, 'html.parser')\n    for a in soup.select('a[href]'):\n\
-        \        label = a.get_text(' ', strip=True).lower()\n        if 'next' in a.get('rel', []) or re.fullmatch(r'next\\\
-        s*[\u2192\xBB\u203A]?', label):\n            target = url.urljoin(BASE + '/announcements/', a['href'])\n         \
-        \   parsed = url.urlparse(target)\n            if parsed.hostname == 'www.screener.in' and parsed.path == '/announcements/':\n\
-        \                return target\n    return None\n\n\ndef financials(page):\n    \"\"\"Use dated table columns; preserve\
-        \ source metric names and displayed precision.\"\"\"\n    soup = BeautifulSoup(page, 'html.parser')\n    section =\
-        \ soup.select_one('#quarters')\n    if not section:\n        return None\n    rows = [[c.get_text(' ', strip=True).replace('+',\
-        \ '').strip()\n             for c in r.select('th, td')] for r in section.select('tr')]\n    if not rows:\n      \
-        \  return None\n    periods = {}\n    for i, label in enumerate(rows[0]):\n        try:\n            dt = datetime.strptime(label,\
-        \ '%b %Y')\n            periods[dt.year * 12 + dt.month] = i\n        except ValueError:\n            pass\n    if\
-        \ not periods:\n        return None\n    latest = max(periods)\n    if latest - 3 not in periods or latest - 12 not\
-        \ in periods:\n        return None\n    i, q, y = periods[latest], periods[latest - 3], periods[latest - 12]\n   \
-        \ date = datetime.strptime(rows[0][i], '%b %Y').replace(tzinfo=timezone.utc)\n    if not -7 <= (datetime.now(timezone.utc)\
-        \ - date).days <= 220:\n        return None\n    basis_text = section.get_text(' ', strip=True)\n    basis = 'Consolidated'\
-        \ if 'Consolidated Figures' in basis_text else 'Standalone' if 'Standalone Figures' in basis_text else None\n    if\
-        \ not basis or 'Crores' not in basis_text:\n        return None\n    lines = ['Latest available quarterly figures:\
-        \ ' + rows[0][i] + ' | ' + basis,\n             'Amounts: INR crore; EPS: INR/share',\n             'YoY comparison:\
-        \ ' + rows[0][y] + '; QoQ: ' + rows[0][q]]\n    count = 0\n    for row in rows[1:]:\n        if not row or row[0]\
-        \ not in ('Sales', 'Revenue', 'Operating Profit', 'Financing Profit', 'Profit before tax', 'Net Profit', 'EPS in Rs',\
-        \ 'OPM %', 'Other Income'):\n            continue\n        if len(row) <= max(i, q, y):\n            continue\n  \
-        \      try:\n            numbers = [float(row[j].replace(',', '').replace('%', '')) for j in (i, y, q)]\n        except\
-        \ ValueError:\n            continue\n        current, yearly, quarterly = numbers\n        if row[0] == 'OPM %':\n\
-        \            lines.append(f'OPM: {row[i]} | YoY change {current-yearly:+.2f} pp | QoQ {current-quarterly:+.2f} pp')\n\
-        \        else:\n            def growth(previous):\n                return f'{(current/previous-1)*100:+.2f}%' if previous\
-        \ > 0 else 'N/A (prior <= 0)'\n            lines.append(f'{row[0]}: {row[i]} | YoY {growth(yearly)} | QoQ {growth(quarterly)}')\n\
-        \        count += 1\n    if count < 3:\n        return None\n    lines.append('Calculated from displayed figures;\
-        \ percentages may differ due to rounding. Operating Profit is not labelled company-reported EBITDA.')\n    return\
-        \ '\\n'.join(lines)\n\n\nclass StateStore:\n    def __init__(self):\n        self.repo = os.environ['GITHUB_REPOSITORY']\n\
-        \        self.branch = os.environ['GITHUB_REF_NAME']\n        self.token = os.environ['GH_TOKEN']\n        self.endpoint\
-        \ = 'https://api.github.com/repos/' + self.repo + '/contents/' + STATE_PATH\n        self.sha = None\n        self.state\
-        \ = {'version': 1, 'seen': {}, 'pending': []}\n        self.fresh = False\n\n    def api(self, target, data=None):\n\
-        \        request = web.Request(target, data=json.dumps(data).encode() if data is not None else None,\n           \
-        \ headers={'Authorization': 'Bearer ' + self.token, 'Accept': 'application/vnd.github+json',\n                   \
-        \  'Content-Type': 'application/json', 'User-Agent': 'Darpan-Corporate-Alerts'},\n            method='PUT' if data\
-        \ is not None else 'GET')\n        with web.urlopen(request, timeout=25) as response:\n            return json.load(response)\n\
-        \n    def read(self):\n        try:\n            result = self.api(self.endpoint + '?ref=' + url.quote(self.branch,\
-        \ safe=''))\n        except urllib.error.HTTPError as error:\n            if error.code != 404:\n                raise\n\
-        \            self.fresh = True\n            return\n        self.sha = result['sha']\n        self.state = json.loads(base64.b64decode(result['content']))\n\
+      run: "\"\"\"Monitor accessible Screener announcement cards; secrets come only from env.\"\"\"\nimport base64\n\
+        import hashlib\nimport http.cookiejar\nimport json\nimport os\nimport re\nimport time\nimport urllib.error\n\
+        import urllib.parse as url\nimport urllib.request as web\nfrom datetime import datetime, timezone\nfrom\
+        \ bs4 import BeautifulSoup\n\nBASE = 'https://www.screener.in'\nMAX_PAGES = 5\nMAX_SEND = 25\nSTATE_PATH\
+        \ = 'corporate-alert-state.json'\n\n\ndef digest(value):\n    return hashlib.sha256(value.encode()).hexdigest()\n\
+        \n\ndef cards(page):\n    soup = BeautifulSoup(page, 'html.parser')\n    found, seen = [], set()\n    for\
+        \ anchor in soup.select('a[href]'):\n        href = url.urljoin(BASE, anchor['href'])\n        host = (url.urlparse(href).hostname\
+        \ or '').lower()\n        allowed = ('bseindia.com', 'nseindia.com', 'screener.in')\n        if not any(host\
+        \ == d or host.endswith('.' + d) for d in allowed):\n            continue\n        if not ('.pdf' in href.lower()\
+        \ or 'downloadattach' in href.lower()):\n            continue\n        for parent in anchor.parents:\n \
+        \           if parent.name in ('body', 'html'):\n                break\n            companies = parent.select('a[href*=\"\
+        /company/\"]')\n            if len(companies) > 1:\n                break\n            if not companies:\n\
+        \                continue\n            company = companies[0]\n            name = company.get_text(' ',\
+        \ strip=True)\n            text = parent.get_text(' ', strip=True)\n            title = anchor.get_text('\
+        \ ', strip=True)\n            if not name or not title or len(text) > 3500:\n                break\n   \
+        \         identity = digest(name + '|' + href)\n            if identity not in seen:\n                seen.add(identity)\n\
+        \                found.append({'id': identity, 'name': name, 'title': title,\n                         \
+        \     'text': text, 'link': href,\n                              'company': url.urljoin(BASE, company['href'])})\n\
+        \            break\n    return found\n\n\ndef next_page(page):\n    soup = BeautifulSoup(page, 'html.parser')\n\
+        \    for a in soup.select('a[href]'):\n        label = a.get_text(' ', strip=True).lower()\n        if 'next'\
+        \ in a.get('rel', []) or re.fullmatch(r'next\\s*[\u2192\xBB\u203A]?', label):\n            target = url.urljoin(BASE\
+        \ + '/announcements/', a['href'])\n            parsed = url.urlparse(target)\n            if parsed.hostname\
+        \ == 'www.screener.in' and parsed.path == '/announcements/':\n                return target\n    return\
+        \ None\n\n\ndef financials(page):\n    \"\"\"Use dated table columns; preserve source metric names and displayed\
+        \ precision.\"\"\"\n    soup = BeautifulSoup(page, 'html.parser')\n    section = soup.select_one('#quarters')\n\
+        \    if not section:\n        return None\n    rows = [[c.get_text(' ', strip=True).replace('+', '').strip()\n\
+        \             for c in r.select('th, td')] for r in section.select('tr')]\n    if not rows:\n        return\
+        \ None\n    periods = {}\n    for i, label in enumerate(rows[0]):\n        try:\n            dt = datetime.strptime(label,\
+        \ '%b %Y')\n            periods[dt.year * 12 + dt.month] = i\n        except ValueError:\n            pass\n\
+        \    if not periods:\n        return None\n    latest = max(periods)\n    if latest - 3 not in periods or\
+        \ latest - 12 not in periods:\n        return None\n    i, q, y = periods[latest], periods[latest - 3],\
+        \ periods[latest - 12]\n    date = datetime.strptime(rows[0][i], '%b %Y').replace(tzinfo=timezone.utc)\n\
+        \    if not -7 <= (datetime.now(timezone.utc) - date).days <= 220:\n        return None\n    basis_text\
+        \ = section.get_text(' ', strip=True)\n    basis = 'Consolidated' if 'Consolidated Figures' in basis_text\
+        \ else 'Standalone' if 'Standalone Figures' in basis_text else None\n    if not basis or 'Crores' not in\
+        \ basis_text:\n        return None\n    lines = ['Latest available quarterly figures: ' + rows[0][i] + '\
+        \ | ' + basis,\n             'Amounts: INR crore; EPS: INR/share',\n             'YoY comparison: ' + rows[0][y]\
+        \ + '; QoQ: ' + rows[0][q]]\n    count = 0\n    for row in rows[1:]:\n        if not row or row[0] not in\
+        \ ('Sales', 'Revenue', 'Operating Profit', 'Financing Profit', 'Profit before tax', 'Net Profit', 'EPS in\
+        \ Rs', 'OPM %', 'Other Income'):\n            continue\n        if len(row) <= max(i, q, y):\n         \
+        \   continue\n        try:\n            numbers = [float(row[j].replace(',', '').replace('%', '')) for j\
+        \ in (i, y, q)]\n        except ValueError:\n            continue\n        current, yearly, quarterly =\
+        \ numbers\n        if row[0] == 'OPM %':\n            lines.append(f'OPM: {row[i]} | YoY change {current-yearly:+.2f}\
+        \ pp | QoQ {current-quarterly:+.2f} pp')\n        else:\n            def growth(previous):\n           \
+        \     return f'{(current/previous-1)*100:+.2f}%' if previous > 0 else 'N/A (prior <= 0)'\n            lines.append(f'{row[0]}:\
+        \ {row[i]} | YoY {growth(yearly)} | QoQ {growth(quarterly)}')\n        count += 1\n    if count < 3:\n \
+        \       return None\n    lines.append('Calculated from displayed figures; percentages may differ due to\
+        \ rounding. Operating Profit is not labelled company-reported EBITDA.')\n    return '\\n'.join(lines)\n\n\
+        \nclass StateStore:\n    def __init__(self):\n        self.repo = os.environ['GITHUB_REPOSITORY']\n    \
+        \    self.branch = os.environ['GITHUB_REF_NAME']\n        self.token = os.environ['GH_TOKEN']\n        self.endpoint\
+        \ = 'https://api.github.com/repos/' + self.repo + '/contents/' + STATE_PATH\n        self.sha = None\n \
+        \       self.state = {'version': 1, 'seen': {}, 'pending': []}\n        self.fresh = False\n\n    def api(self,\
+        \ target, data=None):\n        request = web.Request(target, data=json.dumps(data).encode() if data is not\
+        \ None else None,\n            headers={'Authorization': 'Bearer ' + self.token, 'Accept': 'application/vnd.github+json',\n\
+        \                     'Content-Type': 'application/json', 'User-Agent': 'Darpan-Corporate-Alerts'},\n  \
+        \          method='PUT' if data is not None else 'GET')\n        with web.urlopen(request, timeout=25) as\
+        \ response:\n            return json.load(response)\n\n    def read(self):\n        try:\n            result\
+        \ = self.api(self.endpoint + '?ref=' + url.quote(self.branch, safe=''))\n        except urllib.error.HTTPError\
+        \ as error:\n            if error.code != 404:\n                raise\n            self.fresh = True\n \
+        \           return\n        self.sha = result['sha']\n        self.state = json.loads(base64.b64decode(result['content']))\n\
         \        if self.state.get('version') != 1 or not isinstance(self.state.get('seen'), dict) or not isinstance(self.state.get('pending'),\
-        \ list):\n            raise RuntimeError('Saved state is invalid; refusing to reset deduplication')\n\n    def save(self):\n\
-        \        payload = json.dumps(self.state, separators=(',', ':')).encode()\n        if len(payload) > 850000:\n   \
-        \         raise RuntimeError('State queue too large; refusing to discard announcements')\n        data = {'message':\
-        \ 'Update corporate alert delivery state', 'branch': self.branch,\n                'content': base64.b64encode(payload).decode()}\n\
-        \        if self.sha:\n            data['sha'] = self.sha\n        result = self.api(self.endpoint, data)\n      \
-        \  self.sha = result['content']['sha']\n\n\ndef main():\n    stage = 'configuration'\n    try:\n        values = {k:\
-        \ os.environ.get(k, '') for k in ('SCREENER_EMAIL', 'SCREENER_PASSWORD', 'BOT_TOKEN', 'CHAT_ID')}\n        if not\
-        \ all(values.values()):\n            raise RuntimeError('Required GitHub secret missing')\n        stage = 'Load delivery\
-        \ state'\n        store = StateStore()\n        store.read()\n        state = store.state\n        now = int(time.time())\n\
-        \        state['seen'] = {k: v for k, v in state['seen'].items() if now-v < 30*86400}\n        client = web.build_opener(web.HTTPCookieProcessor(http.cookiejar.CookieJar()))\n\
-        \        client.addheaders = [('User-Agent', 'Mozilla/5.0')]\n        stage = 'Screener login'\n        with client.open(BASE\
-        \ + '/login/', timeout=25) as r:\n            soup = BeautifulSoup(r.read(), 'html.parser')\n        csrf = soup.select_one('input[name=\"\
-        csrfmiddlewaretoken\"]')\n        if not csrf:\n            raise RuntimeError('Login form token missing')\n     \
-        \   data = url.urlencode({'username': values['SCREENER_EMAIL'].strip(), 'password': values['SCREENER_PASSWORD'], 'csrfmiddlewaretoken':\
-        \ csrf['value'], 'next': '/announcements/'}).encode()\n        request = web.Request(BASE + '/login/', data=data,\
-        \ headers={'Referer': BASE + '/login/'})\n        with client.open(request, timeout=25) as r:\n            r.read()\n\
-        \        stage = 'Collect announcement pages'\n        fetched, visited = [], set()\n        target = BASE + '/announcements/'\n\
-        \        while target and len(visited) < MAX_PAGES:\n            if target in visited:\n                break\n  \
-        \          visited.add(target)\n            with client.open(target, timeout=25) as r:\n                path, page\
-        \ = url.urlparse(r.url).path, r.read().decode()\n            if path != '/announcements/' or 'Latest Announcements'\
-        \ not in page:\n                raise RuntimeError('Announcements login/access not confirmed')\n            batch\
-        \ = cards(page)\n            if not batch:\n                raise RuntimeError('Announcement layout not recognised;\
-        \ saved state retained')\n            fetched.extend(batch)\n            if not store.fresh and all(item['id'] in\
-        \ state['seen'] for item in batch):\n                break\n            target = next_page(page)\n            if target:\n\
-        \                time.sleep(2)\n        fetched = list({item['id']: item for item in fetched}.values())\n        if\
-        \ target and len(visited) >= MAX_PAGES:\n            print('NOTICE: Five-page fetch limit reached; full coverage not\
-        \ guaranteed')\n        print('Fetched announcements:', len(fetched), '| Pages:', len(visited))\n        if store.fresh:\n\
-        \            # Establish a baseline rather than broadcasting older history.\n            state['seen'].update({item['id']:\
-        \ now for item in fetched[1:]})\n            state['pending'] = fetched[:1]\n        else:\n            queued = {item['id']\
-        \ for item in state['pending']}\n            state['pending'].extend(item for item in reversed(fetched) if item['id']\
-        \ not in state['seen'] and item['id'] not in queued)\n        stage = 'Save pending queue'\n        store.save() \
-        \ # Verify write permission before any Telegram delivery.\n        sent = 0\n        while state['pending'] and sent\
-        \ < MAX_SEND:\n            item = state['pending'][0]\n            message = '\\n\\n'.join(['Corporate Announcement',\
-        \ item['name'], item['text'][:2000],\n                'Source: Screener (machine summary; verify original filing)',\
-        \ 'Original filing: ' + item['link']])\n            if re.search(r'financial result|quarter|half.year|earnings', item['title']\
-        \ + ' ' + item['text'], re.I):\n                stage = 'Read quarterly table'\n                try:\n           \
-        \         company = url.urlparse(item['company'])\n                    if company.hostname != 'www.screener.in' or\
-        \ not company.path.startswith('/company/'):\n                        raise ValueError('Invalid company link')\n  \
-        \                  path = company.path.rstrip('/')\n                    if not path.endswith('/consolidated'):\n \
-        \                       path += '/consolidated'\n                    with client.open(BASE + path + '/', timeout=20)\
-        \ as r:\n                        report = financials(r.read().decode())\n                    if report:\n        \
-        \                message = '\\n\\n'.join(['Corporate Announcement', item['name'], item['text'][:900], report, 'Source:\
-        \ Screener (machine summary; verify original filing)',\n                            'Screener table: ' + BASE + path\
-        \ + '/', 'Original filing: ' + item['link']])\n                    else:\n                        message += '\\n\\\
-        nComparable quarterly figures not available yet.'\n                except Exception:\n                    print('NOTICE:\
-        \ Quarterly table unavailable; sending original announcement link')\n            stage = 'Telegram delivery'\n   \
-        \         payload = json.dumps({'chat_id': values['CHAT_ID'].strip(), 'text': message[:4000],\n                  \
-        \               'link_preview_options': {'is_disabled': True}}).encode()\n            request = web.Request('https://api.telegram.org/bot'\
-        \ + values['BOT_TOKEN'].strip() + '/sendMessage', data=payload, headers={'Content-Type': 'application/json'})\n  \
-        \          with web.urlopen(request, timeout=25) as r:\n                result = json.load(r)\n            if not\
-        \ result.get('ok'):\n                raise RuntimeError('Telegram rejected message')\n            state['seen'][item['id']]\
-        \ = int(time.time())\n            state['pending'].pop(0)\n            stage = 'Save successful delivery'\n      \
-        \      store.save()  # Persist after each message; never print credentials/cookies.\n            sent += 1\n     \
-        \       time.sleep(1.2)\n        print('SUCCESS: Sent:', sent, '| Waiting:', len(state['pending']))\n        with\
-        \ open(os.environ.get('GITHUB_STEP_SUMMARY', '/tmp/corporate-summary.txt'), 'a') as summary:\n            summary.write(f'Corporate\
-        \ announcements: fetched {len(fetched)}, sent {sent}, waiting {len(state[\"pending\"])}.\\n\\n')\n            summary.write('Source:\
-        \ Screener announcements. Quarterly tables are appended when available. Bulk/block/insider/SAST trades and Market\
-        \ Pulse corporate-action tables are not connected in this version.\\n')\n    except Exception as error:\n        print('Failed\
-        \ stage:', stage)\n        print('Error type:', type(error).__name__)\n        print('HTTP status:', getattr(error,\
-        \ 'code', 'not available'))\n        if isinstance(error, RuntimeError):\n            print(str(error))\n        raise\
-        \ SystemExit(1)\n\n\nif __name__ == '__main__':\n    main()\n"
-# END
+        \ list):\n            raise RuntimeError('Saved state is invalid; refusing to reset deduplication')\n\n\
+        \    def save(self):\n        payload = json.dumps(self.state, separators=(',', ':')).encode()\n       \
+        \ if len(payload) > 850000:\n            raise RuntimeError('State queue too large; refusing to discard\
+        \ announcements')\n        data = {'message': 'Update corporate alert delivery state', 'branch': self.branch,\n\
+        \                'content': base64.b64encode(payload).decode()}\n        if self.sha:\n            data['sha']\
+        \ = self.sha\n        result = self.api(self.endpoint, data)\n        self.sha = result['content']['sha']\n\
+        \n\ndef main():\n    stage = 'configuration'\n    try:\n        values = {k: os.environ.get(k, '') for k\
+        \ in ('SCREENER_EMAIL', 'SCREENER_PASSWORD', 'BOT_TOKEN', 'CHAT_ID')}\n        if not all(values.values()):\n\
+        \            raise RuntimeError('Required GitHub secret missing')\n        stage = 'Load delivery state'\n\
+        \        store = StateStore()\n        store.read()\n        state = store.state\n        now = int(time.time())\n\
+        \        state['seen'] = {k: v for k, v in state['seen'].items() if now-v < 30*86400}\n        client =\
+        \ web.build_opener(web.HTTPCookieProcessor(http.cookiejar.CookieJar()))\n        client.addheaders = [('User-Agent',\
+        \ 'Mozilla/5.0')]\n        stage = 'Screener login'\n        with client.open(BASE + '/login/', timeout=25)\
+        \ as r:\n            soup = BeautifulSoup(r.read(), 'html.parser')\n        csrf = soup.select_one('input[name=\"\
+        csrfmiddlewaretoken\"]')\n        if not csrf:\n            raise RuntimeError('Login form token missing')\n\
+        \        data = url.urlencode({'username': values['SCREENER_EMAIL'].strip(), 'password': values['SCREENER_PASSWORD'],\
+        \ 'csrfmiddlewaretoken': csrf['value'], 'next': '/announcements/'}).encode()\n        request = web.Request(BASE\
+        \ + '/login/', data=data, headers={'Referer': BASE + '/login/'})\n        with client.open(request, timeout=25)\
+        \ as r:\n            r.read()\n        stage = 'Collect announcement pages'\n        fetched, visited =\
+        \ [], set()\n        target = BASE + '/announcements/'\n        while target and len(visited) < MAX_PAGES:\n\
+        \            if target in visited:\n                break\n            visited.add(target)\n           \
+        \ with client.open(target, timeout=25) as r:\n                path, page = url.urlparse(r.url).path, r.read().decode()\n\
+        \            if path != '/announcements/' or 'Latest Announcements' not in page:\n                raise\
+        \ RuntimeError('Announcements login/access not confirmed')\n            batch = cards(page)\n          \
+        \  if not batch:\n                raise RuntimeError('Announcement layout not recognised; saved state retained')\n\
+        \            fetched.extend(batch)\n            if not store.fresh and all(item['id'] in state['seen'] for\
+        \ item in batch):\n                break\n            target = next_page(page)\n            if target:\n\
+        \                time.sleep(2)\n        fetched = list({item['id']: item for item in fetched}.values())\n\
+        \        if target and len(visited) >= MAX_PAGES:\n            print('NOTICE: Five-page fetch limit reached;\
+        \ full coverage not guaranteed')\n        print('Fetched announcements:', len(fetched), '| Pages:', len(visited))\n\
+        \        if store.fresh:\n            # Establish a baseline rather than broadcasting older history.\n \
+        \           state['seen'].update({item['id']: now for item in fetched[1:]})\n            state['pending']\
+        \ = fetched[:1]\n        else:\n            queued = {item['id'] for item in state['pending']}\n       \
+        \     state['pending'].extend(item for item in reversed(fetched) if item['id'] not in state['seen'] and\
+        \ item['id'] not in queued)\n        stage = 'Save pending queue'\n        store.save()  # Verify write\
+        \ permission before any Telegram delivery.\n        sent = 0\n        while state['pending'] and sent <\
+        \ MAX_SEND:\n            item = state['pending'][0]\n            message = '\\n\\n'.join(['Corporate Announcement',\
+        \ item['name'], item['text'][:2000],\n                'Source: Screener (machine summary; verify original\
+        \ filing)', 'Original filing: ' + item['link']])\n            if re.search(r'financial result|quarter|half.year|earnings',\
+        \ item['title'] + ' ' + item['text'], re.I):\n                stage = 'Read quarterly table'\n         \
+        \       try:\n                    company = url.urlparse(item['company'])\n                    if company.hostname\
+        \ != 'www.screener.in' or not company.path.startswith('/company/'):\n                        raise ValueError('Invalid\
+        \ company link')\n                    path = company.path.rstrip('/')\n                    if not path.endswith('/consolidated'):\n\
+        \                        path += '/consolidated'\n                    with client.open(BASE + path + '/',\
+        \ timeout=20) as r:\n                        report = financials(r.read().decode())\n                  \
+        \  if report:\n                        message = '\\n\\n'.join(['Corporate Announcement', item['name'],\
+        \ item['text'][:900], report, 'Source: Screener (machine summary; verify original filing)',\n          \
+        \                  'Screener table: ' + BASE + path + '/', 'Original filing: ' + item['link']])\n      \
+        \              else:\n                        message += '\\n\\nComparable quarterly figures not available\
+        \ yet.'\n                except Exception:\n                    print('NOTICE: Quarterly table unavailable;\
+        \ sending original announcement link')\n            stage = 'Telegram delivery'\n            payload = json.dumps({'chat_id':\
+        \ values['CHAT_ID'].strip(), 'text': message[:4000],\n                                 'link_preview_options':\
+        \ {'is_disabled': True}}).encode()\n            request = web.Request('https://api.telegram.org/bot' + values['BOT_TOKEN'].strip()\
+        \ + '/sendMessage', data=payload, headers={'Content-Type': 'application/json'})\n            with web.urlopen(request,\
+        \ timeout=25) as r:\n                result = json.load(r)\n            if not result.get('ok'):\n     \
+        \           raise RuntimeError('Telegram rejected message')\n            state['seen'][item['id']] = int(time.time())\n\
+        \            state['pending'].pop(0)\n            stage = 'Save successful delivery'\n            store.save()\
+        \  # Persist after each message; never print credentials/cookies.\n            sent += 1\n            time.sleep(1.2)\n\
+        \        print('SUCCESS: Sent:', sent, '| Waiting:', len(state['pending']))\n        with open(os.environ.get('GITHUB_STEP_SUMMARY',\
+        \ '/tmp/corporate-summary.txt'), 'a') as summary:\n            summary.write(f'Corporate announcements:\
+        \ fetched {len(fetched)}, sent {sent}, waiting {len(state[\"pending\"])}.\\n\\n')\n            summary.write('Source:\
+        \ Screener announcements. Quarterly tables are appended when available. Bulk/block/insider/SAST trades and\
+        \ Market Pulse corporate-action tables are not connected in this version.\\n')\n    except Exception as\
+        \ error:\n        print('Failed stage:', stage)\n        print('Error type:', type(error).__name__)\n  \
+        \      print('HTTP status:', getattr(error, 'code', 'not available'))\n        if isinstance(error, RuntimeError):\n\
+        \            print(str(error))\n        raise SystemExit(1)\n\n\nif __name__ == '__main__':\n    main()\n"
+    name: Corporate announcements
+  market_pulse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: always() && !cancelled() && github.ref_name == github.event.repository.default_branch
+    steps:
+    - name: Install HTML reader
+      run: python -m pip install --quiet beautifulsoup4==4.14.3
+    - name: Monitor Market Pulse and send Telegram alerts
+      env:
+        SCREENER_EMAIL: ${{ secrets.SCREENER_EMAIL }}
+        SCREENER_PASSWORD: ${{ secrets.SCREENER_PASSWORD }}
+        BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        CHAT_ID: ${{ secrets.CHAT_ID }}
+        GH_TOKEN: ${{ github.token }}
+      shell: python
+      run: "\"\"\"Monitor readable Market Pulse rows without interpreting or inventing metrics.\"\"\"\nimport base64\n\
+        import hashlib\nimport http.cookiejar\nimport json\nimport os\nimport re\nimport time\nimport urllib.error\n\
+        import urllib.parse as url\nimport urllib.request as web\nfrom datetime import datetime\nfrom decimal import\
+        \ Decimal, InvalidOperation\nfrom zoneinfo import ZoneInfo\nfrom bs4 import BeautifulSoup\n\nBASE = 'https://www.screener.in'\n\
+        STATE_PATH = 'market-pulse-state.json'\nMAX_PAGES = 2\nMAX_SEND = 30\nFII_SOURCE = 'https://www.nseindia.com/reports/fii-dii'\n\
+        FII_API = 'https://www.nseindia.com/api/fiidiiTradeReact'\nSOURCES = [\n    ('Bulk Deals', '/trades/bulk/?o=-2'),\n\
+        \    ('Block Deals', '/trades/block/?o=-2'),\n    ('SAST Trades', '/trades/sast/?o=-2'),\n    ('Insider\
+        \ Trades', '/trades/insiders/?o=-2'),\n    ('Bonus', '/actions/bonus/?o=-1'),\n    ('Rights', '/actions/right/?o=-1'),\n\
+        \    ('Split', '/actions/split/?o=-1'),\n    ('Buyback', '/actions/buyback/?o=-1'),\n    ('Dividend', '/actions/dividend/?o=-1'),\n\
+        \    ('Concalls', '/concalls/'),\n    ('Upcoming Concalls', '/concalls/upcoming/'),\n    ('Annual Reports',\
+        \ '/annual-reports/'),\n    ('Upcoming Results', '/upcoming-results/'),\n]\n\n\ndef digest(value):\n   \
+        \ return hashlib.sha256(value.encode()).hexdigest()\n\n\ndef safe_link(value):\n    target = url.urljoin(BASE,\
+        \ value)\n    p = url.urlparse(target)\n    host = (p.hostname or '').lower()\n    if p.scheme == 'https'\
+        \ and not p.username and not p.password and any(\n            host == d or host.endswith('.' + d)\n    \
+        \        for d in ('screener.in', 'bseindia.com', 'nseindia.com')):\n        return target\n    return None\n\
+        \n\ndef parse_items(page, name, source):\n    soup = BeautifulSoup(page, 'html.parser')\n    main = soup.find('main')\
+        \ or soup\n    title = main.find('h1')\n    if not title:\n        raise RuntimeError('Section heading missing')\n\
+        \    table = main.select_one('table#result_list')\n    if table is None:\n        tables = main.select('table')\n\
+        \        if len(tables) == 1:\n            table = tables[0]\n    items = []\n    if table is not None:\n\
+        \        head_rows = table.select('thead tr')\n        if len(head_rows) != 1:\n            raise RuntimeError('Multi-level\
+        \ or missing table header; layout review required')\n        heads = head_rows[0].find_all(['th', 'td'],\
+        \ recursive=False)\n        if any(int(c.get('colspan', 1)) != 1 or int(c.get('rowspan', 1)) != 1 for c\
+        \ in heads):\n            raise RuntimeError('Merged header cells; layout review required')\n        headers\
+        \ = [h.get_text(' ', strip=True) for h in heads]\n        if len(headers) < 2 or any(not h for h in headers):\n\
+        \            raise RuntimeError('Incomplete table labels')\n        for row in table.select('tbody tr'):\n\
+        \            cells = row.find_all(['th', 'td'], recursive=False)\n            if len(cells) == 1 and int(cells[0].get('colspan',\
+        \ 1)) > 1:\n                if re.search(r'no (results|records)', cells[0].get_text(' ', strip=True), re.I):\n\
+        \                    continue\n            if len(cells) != len(headers) or any(int(c.get('colspan', 1))\
+        \ != 1 or int(c.get('rowspan', 1)) != 1 for c in cells):\n                raise RuntimeError('Table labels\
+        \ do not match values')\n            values = [c.get_text(' ', strip=True) for c in cells]\n           \
+        \ if not any(values):\n                continue\n            if any(len(v) > 500 for v in values):\n   \
+        \             raise RuntimeError('Unexpectedly long table value')\n            links = list(dict.fromkeys(filter(None,\
+        \ (safe_link(a['href']) for a in row.select('a[href]')))))\n            lines = [f'{h}: {v or \"Not provided\"\
+        }' for h, v in zip(headers, values)]\n            identity = digest(name + '|' + json.dumps(list(zip(headers,\
+        \ values)), ensure_ascii=False))\n            text = name + '\\n\\n' + '\\n'.join(lines)\n            text\
+        \ += '\\n\\nSource: Screener\\n' + source\n            if links:\n                text += '\\nRelated link:\
+        \ ' + links[0]\n            if len(text) > 3900:\n                raise RuntimeError('Record exceeds Telegram\
+        \ message limit')\n            items.append({'id': identity, 'section': name, 'text': text})\n    elif name\
+        \ == 'Annual Reports':\n        for a in main.select('a[href]'):\n            target = safe_link(a['href'])\n\
+        \            if not target or not ('.pdf' in target.lower() or 'downloadattach' in target.lower()):\n  \
+        \              continue\n            label = a.get_text(' ', strip=True)\n            company = ''\n   \
+        \         for parent in a.parents:\n                if parent.name in ('main', 'body', 'html'):\n      \
+        \              break\n                companies = parent.select('a[href*=\"/company/\"]')\n            \
+        \    if len(companies) > 1:\n                    break\n                if len(companies) == 1:\n      \
+        \              company = companies[0].get_text(' ', strip=True)\n                    break\n           \
+        \ text = 'Annual Reports\\n\\n' + (company + '\\n' if company else '')\n            text += (label[:500]\
+        \ or 'Annual report document')\n            text += '\\n\\nDocument: ' + target + '\\nSource: Screener\\\
+        n' + source\n            items.append({'id': digest(name + '|' + target), 'section': name, 'text': text})\n\
+        \        if not items:\n            raise RuntimeError('Annual report document layout not recognised')\n\
+        \    else:\n        raise RuntimeError('Expected table not found')\n    return list({item['id']: item for\
+        \ item in items}.values())\n\n\ndef following_page(page, current):\n    soup = BeautifulSoup(page, 'html.parser')\n\
+        \    parsed = url.urlparse(current)\n    candidates = []\n    for a in soup.select('a[href]'):\n       \
+        \ label = a.get_text(' ', strip=True).lower()\n        if 'next' in a.get('rel', []) or re.fullmatch(r'next\\\
+        s*[\u2192\xBB\u203A]?', label):\n            candidates.append(a['href'])\n    # Django list pages expose\
+        \ numbered links without a Next button.\n    current_number = 1\n    for selected in soup.select('.paginator\
+        \ .this-page, .pagination .current'):\n        if selected.get_text(strip=True).isdigit():\n           \
+        \ current_number = int(selected.get_text(strip=True))\n    for a in soup.select('.paginator a[href], .pagination\
+        \ a[href]'):\n        if a.get_text(strip=True) == str(current_number + 1):\n            candidates.append(a['href'])\n\
+        \    for href in candidates:\n        target = url.urljoin(current, href)\n        p = url.urlparse(target)\n\
+        \        if p.scheme == 'https' and p.hostname == parsed.hostname and p.path == parsed.path and target !=\
+        \ current:\n            return target\n    return None\n\n\ndef fii_item(data):\n    \"\"\"Require dated,\
+        \ internally consistent cash-market figures from NSE.\"\"\"\n    if not isinstance(data, list):\n      \
+        \  raise RuntimeError('NSE institutional data is not a list')\n    rows = {r.get('category'): r for r in\
+        \ data if isinstance(r, dict)}\n    if not {'FII/FPI', 'DII'}.issubset(rows):\n        raise RuntimeError('NSE\
+        \ FII/FPI or DII row missing')\n    selected = [rows['FII/FPI'], rows['DII']]\n    if selected[0].get('date')\
+        \ != selected[1].get('date'):\n        raise RuntimeError('NSE institutional dates do not match')\n    date_label\
+        \ = selected[0].get('date', '')\n    try:\n        day = datetime.strptime(date_label, '%d-%b-%Y').date()\n\
+        \    except ValueError:\n        raise RuntimeError('NSE institutional date format not recognised') from\
+        \ None\n    age = (datetime.now(ZoneInfo('Asia/Kolkata')).date() - day).days\n    if not 0 <= age <= 10:\n\
+        \        raise RuntimeError('NSE institutional data is stale or future dated')\n    lines = ['FII/FPI &\
+        \ DII cash-market activity', 'Trade date: ' + date_label,\n             'Amounts: INR crore | Provisional\
+        \ data']\n    normalised = []\n    for row in selected:\n        try:\n            buy, sell, net = [Decimal(str(row[k]).replace(',',\
+        \ ''))\n                              for k in ('buyValue', 'sellValue', 'netValue')]\n        except (InvalidOperation,\
+        \ KeyError):\n            raise RuntimeError('NSE institutional numeric field invalid') from None\n    \
+        \    if not all(n.is_finite() for n in (buy, sell, net)) or buy < 0 or sell < 0 or abs(buy - sell - net)\
+        \ > Decimal('0.05'):\n            raise RuntimeError('NSE institutional totals do not reconcile')\n    \
+        \    lines.extend(['', row['category'], f'Buy: {buy:,.2f}', f'Sell: {sell:,.2f}', f'Net: {net:+,.2f}'])\n\
+        \        normalised.append([row['category'], str(buy.normalize()), str(sell.normalize()), str(net.normalize())])\n\
+        \    lines.extend(['', 'Daily market totals; these do not identify purchases in individual stocks.',\n \
+        \                 'Revised source figures may generate a further alert.', 'Source: NSE', FII_SOURCE])\n\
+        \    return {'id': digest('NSE-FII-DII|' + date_label + '|' + json.dumps(normalised)),\n            'section':\
+        \ 'FII/DII (NSE)', 'text': '\\n'.join(lines)}\n\n\ndef read_fii():\n    # Independent of the signed-in Screener\
+        \ session; no account secrets go to NSE.\n    request = web.Request(FII_API, headers={'User-Agent': 'Mozilla/5.0',\n\
+        \        'Accept': 'application/json', 'Referer': FII_SOURCE})\n    with web.urlopen(request, timeout=15)\
+        \ as r:\n        return fii_item(json.load(r))\n\n\ndef login():\n    client = web.build_opener(web.HTTPCookieProcessor(http.cookiejar.CookieJar()))\n\
+        \    client.addheaders = [('User-Agent', 'Mozilla/5.0')]\n    with client.open(BASE + '/login/', timeout=20)\
+        \ as r:\n        csrf = BeautifulSoup(r.read(), 'html.parser').select_one('input[name=\"csrfmiddlewaretoken\"\
+        ]')\n    if not csrf:\n        raise RuntimeError('Login form token missing')\n    data = url.urlencode({'username':\
+        \ os.environ['SCREENER_EMAIL'].strip(),\n        'password': os.environ['SCREENER_PASSWORD'], 'csrfmiddlewaretoken':\
+        \ csrf['value'],\n        'next': '/announcements/'}).encode()\n    with client.open(web.Request(BASE +\
+        \ '/login/', data=data,\n            headers={'Referer': BASE + '/login/'}), timeout=20) as r:\n       \
+        \ r.read()\n    with client.open(BASE + '/announcements/', timeout=20) as r:\n        if url.urlparse(r.url).path\
+        \ != '/announcements/' or b'Latest Announcements' not in r.read():\n            raise RuntimeError('Screener\
+        \ login not confirmed')\n    return client\n\n\nclass StateStore:\n    def __init__(self):\n        self.branch\
+        \ = os.environ['GITHUB_REF_NAME']\n        self.endpoint = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY']\
+        \ + '/contents/' + STATE_PATH\n        self.sha = None\n        self.state = {'version': 1, 'seen': {},\
+        \ 'pending': [], 'initialized': [], 'setup_sent': False}\n\n    def api(self, target, data=None):\n    \
+        \    req = web.Request(target, data=json.dumps(data).encode() if data is not None else None,\n         \
+        \   headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json',\n\
+        \                     'Content-Type': 'application/json', 'User-Agent': 'Darpan-Market-Pulse'},\n      \
+        \      method='PUT' if data is not None else 'GET')\n        with web.urlopen(req, timeout=25) as r:\n \
+        \           return json.load(r)\n\n    def read(self):\n        try:\n            data = self.api(self.endpoint\
+        \ + '?ref=' + url.quote(self.branch, safe=''))\n        except urllib.error.HTTPError as error:\n      \
+        \      if error.code != 404:\n                raise\n            return\n        self.sha = data['sha']\n\
+        \        state = json.loads(base64.b64decode(data['content']))\n        if state.get('version') != 1 or\
+        \ not isinstance(state.get('seen'), dict) or not isinstance(state.get('pending'), list) or not isinstance(state.get('initialized'),\
+        \ list):\n            raise RuntimeError('Invalid saved state; refusing to reset history')\n        self.state\
+        \ = state\n\n    def save(self):\n        payload = json.dumps(self.state, separators=(',', ':')).encode()\n\
+        \        if len(payload) > 850000:\n            raise RuntimeError('State size limit reached; queue retained')\n\
+        \        data = {'message': 'Update Market Pulse delivery state', 'branch': self.branch,\n             \
+        \   'content': base64.b64encode(payload).decode()}\n        if self.sha:\n            data['sha'] = self.sha\n\
+        \        self.sha = self.api(self.endpoint, data)['content']['sha']\n\n\ndef send(text):\n    payload =\
+        \ json.dumps({'chat_id': os.environ['CHAT_ID'].strip(), 'text': text,\n        'link_preview_options': {'is_disabled':\
+        \ True}}).encode()\n    request = web.Request('https://api.telegram.org/bot' + os.environ['BOT_TOKEN'].strip()\
+        \ + '/sendMessage',\n        data=payload, headers={'Content-Type': 'application/json'})\n    with web.urlopen(request,\
+        \ timeout=25) as r:\n        if not json.load(r).get('ok'):\n            raise RuntimeError('Telegram rejected\
+        \ delivery')\n\n\ndef monitor(client, store):\n    state = store.state\n    now = int(time.time())\n   \
+        \ state['seen'] = {k: v for k, v in state['seen'].items() if now - v < 180 * 86400}\n    sweeps = state.setdefault('sweeps',\
+        \ {})\n    results, failed = [], []\n    deadline = time.monotonic() + 9 * 60\n    for name, path in SOURCES:\n\
+        \        if time.monotonic() >= deadline:\n            results.append((name, 'Deferred to next run: time\
+        \ budget', 0, 0))\n            continue\n        target, visited, items, capped = BASE + path, set(), [],\
+        \ False\n        try:\n            while target and len(visited) < MAX_PAGES:\n                if target\
+        \ in visited:\n                    raise RuntimeError('Pagination loop detected')\n                visited.add(target)\n\
+        \                with client.open(target, timeout=15) as r:\n                    if url.urlparse(r.url).path\
+        \ != url.urlparse(path).path:\n                        raise RuntimeError('Section redirected; access not\
+        \ confirmed')\n                    page = r.read().decode()\n                items.extend(parse_items(page,\
+        \ name, BASE + path))\n                target = following_page(page, target)\n                time.sleep(1)\n\
+        \            head_next = target\n            capped = bool(target)\n            items = list({item['id']:\
+        \ item for item in items}.values())\n            new_count = 0\n            if name not in state['initialized']:\n\
+        \                state['seen'].update({item['id']: now for item in items})\n                state['initialized'].append(name)\n\
+        \                status = 'Baseline saved'\n            else:\n                queued = {i['id'] for i in\
+        \ state['pending']}\n                for item in items:\n                    if item['id'] in state['seen']:\n\
+        \                        state['seen'][item['id']] = now\n                    elif item['id'] not in queued:\n\
+        \                        state['pending'].append(item)\n                        queued.add(item['id'])\n\
+        \                        new_count += 1\n                status = 'Checked'\n            # Continue through\
+        \ older pages across runs instead of stopping forever\n            # at page two. The first extended sweep\
+        \ silently seeds older history.\n            sweep = sweeps.setdefault(name, {'next': None, 'baseline':\
+        \ True, 'completed': 0})\n            continuation = sweep.get('next') or head_next\n            sweep_note\
+        \ = ''\n            if continuation and time.monotonic() < deadline:\n                parsed = url.urlparse(continuation)\n\
+        \                if parsed.scheme != 'https' or parsed.hostname != 'www.screener.in' or parsed.path != url.urlparse(path).path:\n\
+        \                    raise RuntimeError('Saved pagination URL is invalid')\n                with client.open(continuation,\
+        \ timeout=15) as r:\n                    if url.urlparse(r.url).path != url.urlparse(path).path:\n     \
+        \                   raise RuntimeError('Extended scan access not confirmed')\n                    older_page\
+        \ = r.read().decode()\n                older_items = parse_items(older_page, name, BASE + path)\n      \
+        \          queued = {i['id'] for i in state['pending']}\n                for item in older_items:\n    \
+        \                if sweep['baseline'] or item['id'] in state['seen']:\n                        state['seen'][item['id']]\
+        \ = now\n                    elif item['id'] not in queued:\n                        state['pending'].append(item)\n\
+        \                        queued.add(item['id'])\n                        new_count += 1\n              \
+        \  after = following_page(older_page, continuation)\n                if after == continuation:\n       \
+        \             raise RuntimeError('Extended pagination loop detected')\n                sweep['next'] = after\n\
+        \                items.extend(older_items)\n                if after is None:\n                    sweep['baseline']\
+        \ = False\n                    sweep['completed'] += 1\n                    sweep_note = '; full sweep completed'\n\
+        \                else:\n                    sweep_note = '; older-page scan continues next run'\n      \
+        \          time.sleep(1)\n            elif not continuation:\n                sweep['next'] = None\n   \
+        \             sweep['baseline'] = False\n                sweep['completed'] += 1\n                sweep_note\
+        \ = '; all available pages checked'\n            else:\n                sweep_note = '; extended scan deferred'\n\
+        \            results.append((name, status + sweep_note, len({i['id'] for i in items}), new_count))\n   \
+        \         store.save()  # Checkpoint the queue and pagination after every section.\n            print(name\
+        \ + ': ' + status + '; records=' + str(len(items)) + '; new=' + str(new_count), flush=True)\n        except\
+        \ Exception as error:\n            failed.append(name)\n            detail = type(error).__name__ + (' HTTP\
+        \ ' + str(error.code) if isinstance(error, urllib.error.HTTPError) else '')\n            if isinstance(error,\
+        \ RuntimeError):\n                detail += ': ' + str(error)\n            print('SECTION FAILED: ' + name\
+        \ + ' - ' + detail, flush=True)\n            results.append((name, detail, 0, 0))\n    # One dated FII/FPI\
+        \ + DII message on first successful access, then only if\n    # the source date or figures change. Failure\
+        \ leaves the other queues intact.\n    try:\n        item = read_fii()\n        queued = {i['id'] for i\
+        \ in state['pending']}\n        new = int(item['id'] not in state['seen'] and item['id'] not in queued)\n\
+        \        if new:\n            state['pending'].append(item)\n        elif item['id'] in state['seen']:\n\
+        \            state['seen'][item['id']] = now\n        results.append(('FII/DII (NSE)', 'Dated data verified',\
+        \ 2, new))\n    except Exception as error:\n        failed.append('FII/DII (NSE)')\n        detail = type(error).__name__\
+        \ + (' HTTP ' + str(error.code) if isinstance(error, urllib.error.HTTPError) else '')\n        if isinstance(error,\
+        \ RuntimeError):\n            detail += ': ' + str(error)\n        results.append(('FII/DII (NSE)', detail,\
+        \ 0, 0))\n        print('FII/DII UNAVAILABLE: ' + detail, flush=True)\n    if not state['initialized']:\n\
+        \        raise RuntimeError('No section could be read; no messages sent')\n    setup_id = digest('market-pulse-monitor-started-v1')\n\
+        \    if not state.get('setup_sent') and not any(i['id'] == setup_id for i in state['pending']):\n      \
+        \  state['pending'].insert(0, {'id': setup_id, 'section': 'Setup', 'text':\n            'Market Pulse monitoring\
+        \ started\\n\\nBaseline saved for: ' + ', '.join(state['initialized']) +\n            '\\n\\nExisting history\
+        \ was not broadcast. New or changed records found in monitored pages will be sent.' +\n            '\\nChecks\
+        \ are scheduled about every 30 minutes; GitHub may delay them.' +\n            '\\nThe first two pages are\
+        \ checked each run; older pages are scanned progressively.' +\n            '\\nFII/FPI and DII daily totals\
+        \ use NSE when its dated data is reachable.'})\n    store.save()  # Queue must be durable before Telegram\
+        \ delivery.\n    sent = 0\n    while state['pending'] and sent < MAX_SEND:\n        item = state['pending'][0]\n\
+        \        send(item['text'])\n        state['seen'][item['id']] = int(time.time())\n        state['pending'].pop(0)\n\
+        \        if item['id'] == setup_id:\n            state['setup_sent'] = True\n        store.save()\n    \
+        \    sent += 1\n        time.sleep(1.2)\n    print(f'SUCCESS: Sent: {sent} | Waiting: {len(state[\"pending\"\
+        ])} | Sections failed: {len(failed)}', flush=True)\n    if os.environ.get('GITHUB_STEP_SUMMARY'):\n    \
+        \    with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:\n            f.write('# Market Pulse alerts\\\
+        n\\n| Section | Status | Read | New |\\n|---|---|---:|---:|\\n')\n            for row in results:\n    \
+        \            f.write('| ' + ' | '.join(map(str, row)) + ' |\\n')\n            f.write(f'\\nSent: {sent}.\
+        \ Waiting: {len(state[\"pending\"])}.\\n\\n')\n            f.write('First successful check of each section\
+        \ saves history without sending older rows. Later checks send newly observed or changed rows, which may\
+        \ include older dated records newly entering these pages.\\n\\n')\n            f.write('The first two pages\
+        \ are checked each run, plus one older page per section. Older-page scans resume across runs; the first\
+        \ extended sweep seeds older history silently. Later full sweeps look for newly observed or changed records.\
+        \ Fast-moving pagination and source delays can still cause missed records; full real-time coverage is not\
+        \ guaranteed.\\n\\n')\n            f.write('FII/FPI and DII are dated provisional cash-market totals from\
+        \ NSE, not company-specific holdings. Annual reports are document alerts, not report summaries. Existing\
+        \ Corporate Auto Alerts handles announcements and quarterly figures separately.\\n')\n    if failed:\n \
+        \       raise RuntimeError('Some sections failed; successful sections and pending queue were saved')\n\n\
+        \ndef main():\n    try:\n        if not all(os.environ.get(k) for k in ('SCREENER_EMAIL', 'SCREENER_PASSWORD',\
+        \ 'BOT_TOKEN', 'CHAT_ID', 'GH_TOKEN')):\n            raise RuntimeError('Required GitHub secret or token\
+        \ missing')\n        store = StateStore()\n        store.read()\n        monitor(login(), store)\n    except\
+        \ Exception as error:\n        print('FAILED: ' + type(error).__name__, flush=True)\n        if isinstance(error,\
+        \ RuntimeError):\n            print(str(error), flush=True)\n        elif isinstance(error, urllib.error.HTTPError):\n\
+        \            print('HTTP status: ' + str(error.code), flush=True)\n        raise SystemExit(1)\n\n\nif __name__\
+        \ == '__main__':\n    main()\n"
+    name: Market Pulse and FII/DII alerts
+    needs: monitor

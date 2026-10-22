@@ -15,49 +15,57 @@ jobs:
         env:
           SCREENER_EMAIL: ${{ secrets.SCREENER_EMAIL }}
           SCREENER_PASSWORD: ${{ secrets.SCREENER_PASSWORD }}
-        shell: bash
         run: |
           python - <<'PY'
-          import os
-          import http.cookiejar
-          import urllib.request
-          import urllib.parse
-          import urllib.error
-          from html.parser import HTMLParser
-
-          class PageParser(HTMLParser):
-              def __init__(self):
-                  super().__init__()
-                  self.csrf = ""
-                  self.links = []
-                  self.current = None
-
-              def handle_starttag(self, tag, attrs):
-                  attrs = dict(attrs)
-                  if tag == "input":
-                      if attrs.get("name") == "csrfmiddlewaretoken":
-                          self.csrf = attrs.get("value", "")
-                  if tag == "a":
-                      self.current = [attrs.get("href", ""), ""]
-
-              def handle_data(self, data):
-                  if self.current is not None:
-                      self.current[1] += data
-
-              def handle_endtag(self, tag):
-                  if tag == "a" and self.current is not None:
-                      self.links.append(self.current)
-                      self.current = None
+          import os, re, http.cookiejar
+          import urllib.request as web
+          import urllib.parse as parse
 
           email = os.environ.get("SCREENER_EMAIL", "").strip()
           password = os.environ.get("SCREENER_PASSWORD", "")
-
           if not email or not password:
               raise SystemExit("Screener secrets missing")
 
-          cookies = http.cookiejar.CookieJar()
-          client = urllib.request.build_opener(
-              urllib.request.HTTPCookieProcessor(cookies)
-          )
-          client.addheaders = [
-              ("User-Agent
+          jar = http.cookiejar.CookieJar()
+          client = web.build_opener(web.HTTPCookieProcessor(jar))
+          client.addheaders = [("User-Agent", "Mozilla/5.0")]
+          base = "https://www.screener.in"
+          stage = "Open login page"
+
+          try:
+              with client.open(base + "/login/", timeout=25) as r:
+                  page = r.read().decode()
+
+              csrf = re.search(
+                  r'name="csrfmiddlewaretoken"\s+value="([^"]+)"',
+                  page
+              )
+              if not csrf:
+                  raise SystemExit("Login form token missing")
+
+              data = parse.urlencode({
+                  "username": email,
+                  "password": password,
+                  "csrfmiddlewaretoken": csrf.group(1),
+                  "next": "/announcements/"
+              }).encode()
+
+              stage = "Submit login"
+              req = web.Request(
+                  base + "/login/", data=data,
+                  headers={"Referer": base + "/login/"}
+              )
+              with client.open(req, timeout=25) as r:
+                  r.read()
+
+              stage = "Open announcements"
+              with client.open(base + "/announcements/", timeout=25) as r:
+                  path = parse.urlparse(r.url).path
+                  page = r.read().decode()
+
+              if path != "/announcements/":
+                  raise SystemExit("Login not confirmed: check credentials or website verification")
+              if "Latest Announcements" not in page:
+                  raise SystemExit("Announcements content not confirmed")
+
+              print("SUCCESS: Login and Announcements access confirmed")

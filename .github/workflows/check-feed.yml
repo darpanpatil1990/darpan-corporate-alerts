@@ -1,40 +1,103 @@
-name: Check Screener Login
+name: Test Corporate Announcement
 on:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  login:
+  announcement:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 4
     steps:
-      - name: Check announcements access
+      - name: Install HTML reader
+        run: python -m pip install --quiet beautifulsoup4==4.14.3
+      - name: Send one announcement to Telegram
         env:
           SCREENER_EMAIL: ${{ secrets.SCREENER_EMAIL }}
           SCREENER_PASSWORD: ${{ secrets.SCREENER_PASSWORD }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
         shell: python
         run: |
-          import os, re, http.cookiejar
-          import urllib.request as w
-          import urllib.parse as p
-          email = os.environ["SCREENER_EMAIL"].strip()
-          password = os.environ["SCREENER_PASSWORD"]
-          assert email and password, "Screener secrets missing"
-          base = "https://www.screener.in"
-          client = w.build_opener(w.HTTPCookieProcessor(http.cookiejar.CookieJar()))
-          client.addheaders = [("User-Agent", "Mozilla/5.0")]
-          with client.open(base + "/login/", timeout=25) as r:
-              page = r.read().decode()
-          token = re.search(r'name="csrfmiddlewaretoken"\s+value="([^"]+)"', page)
-          assert token, "Login form token missing"
-          data = p.urlencode({"username": email, "password": password, "csrfmiddlewaretoken": token.group(1), "next": "/announcements/"}).encode()
-          request = w.Request(base + "/login/", data=data, headers={"Referer": base + "/login/"})
-          with client.open(request, timeout=25) as r:
-              r.read()
-          with client.open(base + "/announcements/", timeout=25) as r:
-              path = p.urlparse(r.url).path
-              page = r.read().decode()
-          assert path == "/announcements/", "Login not confirmed"
-          assert "Latest Announcements" in page, "Announcements not confirmed"
-          print("SUCCESS: Screener login and announcements work")
+          import os, json, http.cookiejar
+          import urllib.request as web
+          import urllib.parse as url
+          from bs4 import BeautifulSoup
+
+          def cards(page):
+              soup = BeautifulSoup(page, 'html.parser')
+              found, seen = [], set()
+              for anchor in soup.select('a[href]'):
+                  href = url.urljoin(base, anchor['href'])
+                  host = (url.urlparse(href).hostname or '').lower()
+                  allowed = ('bseindia.com', 'nseindia.com', 'screener.in')
+                  if not any(host == d or host.endswith('.' + d) for d in allowed):
+                      continue
+                  if not ('.pdf' in href.lower() or 'downloadattach' in href.lower()):
+                      continue
+                  for parent in anchor.parents:
+                      if parent.name in ('body', 'html'):
+                          break
+                      company = parent.select('a[href*="/company/"]')
+                      if len(company) > 1:
+                          break
+                      if not company:
+                          continue
+                      name = company[0].get_text(' ', strip=True)
+                      text = parent.get_text(' ', strip=True)
+                      title = anchor.get_text(' ', strip=True)
+                      if not name or not title or len(text) > 3500:
+                          break
+                      identity = name + '|' + href
+                      if identity not in seen:
+                          seen.add(identity)
+                          found.append((name, title, text, href))
+                      break
+              return found
+
+          base = 'https://www.screener.in'
+          stage = 'configuration'
+          try:
+              values = {k: os.environ.get(k, '') for k in ('SCREENER_EMAIL', 'SCREENER_PASSWORD', 'BOT_TOKEN', 'CHAT_ID')}
+              if not all(values.values()):
+                  raise RuntimeError('Required GitHub secret missing')
+              client = web.build_opener(web.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+              client.addheaders = [('User-Agent', 'Mozilla/5.0')]
+              stage = 'Screener login form'
+              with client.open(base + '/login/', timeout=25) as r:
+                  soup = BeautifulSoup(r.read(), 'html.parser')
+              csrf = soup.select_one('input[name="csrfmiddlewaretoken"]')
+              if not csrf:
+                  raise RuntimeError('Login form token missing')
+              data = url.urlencode({'username': values['SCREENER_EMAIL'].strip(), 'password': values['SCREENER_PASSWORD'], 'csrfmiddlewaretoken': csrf['value'], 'next': '/announcements/'}).encode()
+              stage = 'Screener login'
+              request = web.Request(base + '/login/', data=data, headers={'Referer': base + '/login/'})
+              with client.open(request, timeout=25) as r:
+                  r.read()
+              stage = 'Announcements access'
+              with client.open(base + '/announcements/', timeout=25) as r:
+                  path, page = url.urlparse(r.url).path, r.read().decode()
+              if path != '/announcements/' or 'Latest Announcements' not in page:
+                  raise RuntimeError('Announcements access not confirmed')
+              stage = 'Extract announcement'
+              items = cards(page)
+              print('Announcement cards found:', len(items))
+              if not items:
+                  raise RuntimeError('Card layout not recognised; no message sent')
+              name, title, text, link = items[0]
+              message = '\n\n'.join(['TEST - Corporate Announcement', name, text[:2800], 'Source: Screener (machine summary; verify original filing)', 'Original filing: ' + link])
+              stage = 'Telegram delivery'
+              payload = json.dumps({'chat_id': values['CHAT_ID'].strip(), 'text': message[:4000], 'link_preview_options': {'is_disabled': True}}).encode()
+              request = web.Request('https://api.telegram.org/bot' + values['BOT_TOKEN'].strip() + '/sendMessage', data=payload, headers={'Content-Type': 'application/json'})
+              with web.urlopen(request, timeout=25) as r:
+                  result = json.load(r)
+              if not result.get('ok'):
+                  raise RuntimeError('Telegram rejected message')
+              print('SUCCESS: One announcement sent to Telegram')
+          except Exception as error:
+              print('Failed stage:', stage)
+              print('Error type:', type(error).__name__)
+              print('HTTP status:', getattr(error, 'code', 'not available'))
+              if isinstance(error, RuntimeError):
+                  print(str(error))
+              raise SystemExit(1)
 # END

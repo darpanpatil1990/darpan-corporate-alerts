@@ -1,4 +1,4 @@
-name: Check Free Sources
+name: Test Telegram Results
 
 on:
   workflow_dispatch:
@@ -7,82 +7,166 @@ permissions:
   contents: read
 
 jobs:
-  check:
+  results:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - name: Test Screener and ScanX
+      - name: Send HFCL quarterly results
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
         shell: bash
         run: |
           python - <<'PY'
-          import urllib.request
+          import os
           import re
           import html
+          import json
+          import urllib.request
+          import urllib.error
+          from datetime import datetime
 
-          sources = [
-              ("Screener", "https://www.screener.in/company/HFCL/consolidated/"),
-              ("ScanX", "https://scanx.trade/stock-market-news/orders-deals"),
+          token = os.environ.get("BOT_TOKEN", "").strip()
+          chat_id = os.environ.get("CHAT_ID", "").strip()
+
+          if not token or not chat_id:
+              raise SystemExit("BOT_TOKEN or CHAT_ID secret missing")
+
+          url = "https://www.screener.in/company/HFCL/consolidated/"
+          request = urllib.request.Request(
+              url, headers={"User-Agent": "Mozilla/5.0"}
+          )
+
+          try:
+              with urllib.request.urlopen(request, timeout=25) as response:
+                  page = response.read().decode("utf-8")
+          except Exception:
+              raise SystemExit("Screener fetch failed")
+
+          section = re.search(
+              r'<section\b[^>]*id=["\x27]quarters["\x27][^>]*>(.*?)</section>',
+              page, re.S | re.I
+          )
+          if not section:
+              raise SystemExit("Quarterly table missing")
+
+          rows = []
+          for row in re.findall(
+              r"<tr\b[^>]*>(.*?)</tr>",
+              section.group(1), re.S | re.I
+          ):
+              cells = re.findall(
+                  r"<t[dh]\b[^>]*>(.*?)</t[dh]>",
+                  row, re.S | re.I
+              )
+              rows.append([
+                  " ".join(html.unescape(
+                      re.sub(r"<[^>]+>", " ", cell)
+                  ).split())
+                  for cell in cells
+              ])
+
+          headers = rows[0]
+          periods = {}
+          for index, label in enumerate(headers):
+              try:
+                  date = datetime.strptime(label, "%b %Y")
+                  periods[date.year * 12 + date.month] = index
+              except ValueError:
+                  pass
+
+          if not periods:
+              raise SystemExit("Quarter dates missing")
+
+          latest = max(periods)
+          if latest - 3 not in periods or latest - 12 not in periods:
+              raise SystemExit("Comparable quarters missing")
+
+          now_i = periods[latest]
+          qoq_i = periods[latest - 3]
+          yoy_i = periods[latest - 12]
+
+          def find_row(label):
+              for row in rows[1:]:
+                  if row and row[0].replace("+", "").strip() == label:
+                      return row
+              raise ValueError("Missing row: " + label)
+
+          def number(value):
+              return float(value.replace(",", "").replace("%", ""))
+
+          def growth(current, previous):
+              if previous <= 0:
+                  return "N/A (previous value zero/negative)"
+              return f"{(current / previous - 1) * 100:+.2f}%"
+
+          lines = [
+              "🧪 TEST — HFCL Quarterly Results",
+              "Quarter: " + headers[now_i],
+              "Basis: Consolidated | Amounts: ₹ crore",
+              "YoY: " + headers[yoy_i] + " | QoQ: " + headers[qoq_i],
           ]
 
-          passed = 0
+          metrics = [
+              ("Sales", "Revenue", "₹", " Cr"),
+              ("Operating Profit", "Operating Profit", "₹", " Cr"),
+              ("Profit before tax", "PBT", "₹", " Cr"),
+              ("Net Profit", "Net Profit", "₹", " Cr"),
+              ("EPS in Rs", "EPS", "₹", ""),
+          ]
 
-          for name, url in sources:
-              print("\nSOURCE:", name, flush=True)
-              try:
-                  request = urllib.request.Request(
-                      url,
-                      headers={"User-Agent": "Mozilla/5.0"}
-                  )
-                  with urllib.request.urlopen(request, timeout=25) as response:
-                      page = response.read().decode("utf-8", errors="replace")
-                      print("HTTP:", response.status)
+          for key, label, prefix, suffix in metrics:
+              row = find_row(key)
+              current = number(row[now_i])
+              yearly = number(row[yoy_i])
+              quarterly = number(row[qoq_i])
+              lines.append(
+                  f"{label}: {prefix}{current:g}{suffix}\n"
+                  f"Previous year: {yearly:g} | Previous quarter: {quarterly:g}\n"
+                  f"YoY {growth(current, yearly)} | QoQ {growth(current, quarterly)}"
+              )
 
-                  if name == "Screener":
-                      section = re.search(
-                          r'<section\b[^>]*id=["\x27]quarters["\x27][^>]*>(.*?)</section>',
-                          page, re.S | re.I
-                      )
-                      if not section:
-                          raise ValueError("Quarterly results table not found")
+          margin = find_row("OPM %")
+          lines.append(
+              f"Operating Margin: {margin[now_i]}\n"
+              f"Previous year: {margin[yoy_i]} | Previous quarter: {margin[qoq_i]}"
+          )
 
-                      rows = re.findall(
-                          r"<tr\b[^>]*>(.*?)</tr>",
-                          section.group(1), re.S | re.I
-                      )
-                      if not rows:
-                          raise ValueError("Result rows missing")
+          other = find_row("Other Income")
+          lines.append(
+              f"Other Income: ₹{other[now_i]} Cr\n"
+              f"Previous year: ₹{other[yoy_i]} Cr | Previous quarter: ₹{other[qoq_i]} Cr"
+          )
 
-                      for row in rows[:6]:
-                          text = re.sub(r"<[^>]+>", " ", row)
-                          print(html.unescape(" ".join(text.split())))
+          lines.extend([
+              "Source: Screener. Growth calculated from displayed figures; rounding may affect percentages.",
+              url,
+          ])
 
-                      print("PASS: Quarterly result rows accessible")
+          message = "\n\n".join(lines)
+          payload = json.dumps({
+              "chat_id": chat_id,
+              "text": message,
+              "link_preview_options": {"is_disabled": True},
+          }).encode()
 
-                  else:
-                      links = re.findall(
-                          r'href=["\x27]([^"\x27]+)["\x27]',
-                          page, re.I
-                      )
-                      articles = list(dict.fromkeys(
-                          link for link in links
-                          if "/stock-market-news/" in link
-                          and len(link.split("/")) >= 5
-                      ))
-                      if not articles:
-                          raise ValueError("Article links not found")
+          telegram = urllib.request.Request(
+              "https://api.telegram.org/bot" + token + "/sendMessage",
+              data=payload,
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
 
-                      print("Article links found:", len(articles))
-                      for link in articles[:5]:
-                          print(html.unescape(link))
+          try:
+              with urllib.request.urlopen(telegram, timeout=25) as response:
+                  result = json.load(response)
+          except urllib.error.HTTPError as error:
+              raise SystemExit("Telegram HTTP error: " + str(error.code))
+          except Exception:
+              raise SystemExit("Telegram connection failed")
 
-                      print("PASS: News links accessible")
+          if not result.get("ok"):
+              raise SystemExit("Telegram rejected the message")
 
-                  passed += 1
-
-              except Exception as error:
-                  print("FAIL:", type(error).__name__, str(error))
-
-          print("\nSources passed:", passed, "of", len(sources))
-          if passed != len(sources):
-              raise SystemExit(1)
+          print("SUCCESS: HFCL result sent to Telegram")
           PY

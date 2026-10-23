@@ -12,6 +12,8 @@ from institutional_confluence import (Store, request, UNIVERSE_URL, universe_fro
     day, month_end, login, trade_rows, overlaps, verify_private_destination, BASE, TRADE_PATHS)
 
 MF_API='https://ow-static-scanx.dhan.co/staticscanx/mfpastholdingsbyisin'
+CAP_API='https://ow-scanx-analytics.dhan.co/customscan/fetchdt'
+CAP_LOOKUP={}
 AMC_API='https://ow-static-scanx.dhan.co/staticscanx/amclist_v2'
 ROOT=Path(__file__).resolve().parent
 CACHE=ROOT/'.scanner-cache'
@@ -28,7 +30,7 @@ def read_bytes(address,payload=None):
         for attempt in range(3):
             req=web.Request(address,data=None if payload is None else json.dumps(payload).encode(),headers=headers)
             try:
-                with web.urlopen(req,timeout=35) as r:return r.read()
+                with web.urlopen(req,timeout=20) as r:return r.read()
             except urllib.error.HTTPError as e:
                 if attempt==2 or e.code not in (429,500,502,503,504):raise
                 wait=e.headers.get('Retry-After',str(2**(attempt+1)))
@@ -46,7 +48,24 @@ def cached_json(folder,key,ttl,loader):
     temp=path.with_suffix('.tmp');temp.write_bytes(gzip.compress(json.dumps(value,separators=(',',':')).encode()));temp.replace(path)
     return value
 
+def load_scanx_caps(official_isins):
+    query={'data':{'sorder':'desc','sort':'Mcap','count':1000,'fields':['Sym','Isin','Mcap','Exch','Sid','Seosym'],'params':[{'field':'Exch','op':'','val':'NSE'}],'logic_op':'AND','pgno':1}}
+    data=cached_json('universe','scanx-caps',6*3600,lambda:json.loads(read_bytes(CAP_API,query)))
+    if data.get('code')!=0 or not isinstance(data.get('data'),list):raise ValueError('ScanX market-cap source unavailable')
+    result={}
+    for row in data['data']:
+        if not isinstance(row,dict):raise ValueError('ScanX market-cap schema changed')
+        symbol=row.get('Sym');isin=row.get('Isin')
+        if row.get('Exch')!='NSE' or symbol not in official_isins or official_isins[symbol]!=isin:continue
+        cap=Decimal(str(row.get('Mcap')))
+        if not cap.is_finite() or cap<=0:continue
+        value={'cap':str(cap),'source':CAP_API,'stock_isin':isin,'units':'INR crore','provider_asof':data.get('last_resp_time')}
+        if symbol in result and result[symbol]!=value:raise ValueError('Conflicting ScanX market-cap records')
+        result[symbol]=value
+    return result,{'source':CAP_API,'exact_symbol_isin_matches':len(result),'official_universe':len(official_isins),'fallback_symbols':sorted(set(official_isins)-set(result)),'scope':'Provider top 1000 by market cap; each universe member individually verified by NSE symbol and stock ISIN. Missing identities use the independent Screener check.'}
+
 def market_cap(symbol):
+    if symbol in CAP_LOOKUP:return CAP_LOOKUP[symbol]
     def load():
         target=BASE+'/company/'+url.quote(symbol,safe='')+'/'
         try:html=read_bytes(target)
@@ -207,6 +226,7 @@ def read_disclosures(kind,path,symbols,today,deadline):
             if url.urlparse(response.url).path!=url.urlparse(target).path:raise ValueError('Disclosure access redirected')
             html=response.read().decode()
         seen.add(target);dates=disclosure_dates(html);rows+=len(dates)
+        if len(seen)%25==0:print('DISCLOSURE',kind,'pages',len(seen),'rows',rows,'oldest',str(min(dates)) if dates else 'none',flush=True)
         descending=descending and all(a>=b for a,b in zip(dates,dates[1:])) and (last is None or not dates or last>=max(dates))
         if dates:last=min(dates)
         records.extend(trade_rows(html,kind,symbols,today,target))
@@ -262,6 +282,17 @@ def alert_text(stock,matched):
     lines.extend(['Month-end quantity change is not a verified purchase today. Known splits suppress monthly MF matches; other non-trade changes remain possible.','Demand Lab v31 OHLC-derived bands; no analyst overrides inferred. Public quotes may be delayed.','Price: Yahoo Finance. MF: ScanX dated monthly quantities. Disclosed acquisitions: Screener.'])
     return '\n'.join(lines)[:3950]
 
+def deliver_pending(store,destination,limit=100):
+    if verify_private_destination()!=destination:raise ValueError('Private destination changed during delivery')
+    state=store.state;sent=0
+    while state['pending'] and sent<limit:
+        item=state['pending'][0]
+        response=json.loads(request('https://api.telegram.org/bot'+os.environ['BOT_TOKEN'].strip()+'/sendMessage',{'chat_id':os.environ['CHAT_ID'].strip(),'text':item['text'],'link_preview_options':{'is_disabled':True}}))
+        if not response.get('ok'):raise ValueError('Telegram delivery rejected')
+        state['delivered'].append(item['id']);state['pending'].pop(0);store.save();sent+=1;time.sleep(1.1)
+    if sent:print('PRIVATE DELIVERY',sent,'queued alerts delivered; waiting',len(state['pending']),flush=True)
+    return sent
+
 def main():
     now=datetime.now(IST);dry='--dry-run' in sys.argv;destination=None if dry else verify_private_destination()
     raw=request(UNIVERSE_URL);symbols=universe_from_csv(raw);isin={r['Symbol'].strip():r['ISIN Code'].strip() for r in csv.DictReader(io.StringIO(raw))}
@@ -271,7 +302,12 @@ def main():
     if store:store.read()
     state=store.state if store else {'version':1,'records':{},'pending':[],'delivered':[]}
     if destination and state.get('destination',{}).get('fingerprint')!=destination:raise ValueError('Private recipient must already be verified before full-universe scanning')
+    sent_earlier=deliver_pending(store,destination) if store and state['pending'] else 0
     coverage={};source_errors=[];trade_evidence={}
+    try:
+        cap_data,cap_status=load_scanx_caps(isin);CAP_LOOKUP.update(cap_data);coverage['Market cap']=cap_status
+        print('MARKET CAPS exact official identities',len(cap_data),'/',len(isin),flush=True)
+    except Exception as e:coverage['Market cap']={'source':CAP_API,'fallback':'Independent Screener identity checks','error':type(e).__name__+': '+str(e)[:120]}
     deadline=time.monotonic()+18*60
     if not dry:
         with ThreadPoolExecutor(max_workers=4) as executor:
@@ -321,21 +357,16 @@ def main():
                     state['records'][symbol]=stock
                 print('CHECKED',symbol,'inside',len(stock.get('zones',[])),'match',bool(stock.get('evidence')),flush=True)
             except Exception as e:
-                failed[symbol]=type(e).__name__+': '+str(e)[:160];print('UNAVAILABLE',symbol,failed[symbol],flush=True)
+                failed[symbol]=type(e).__name__+': '+str(e)[:160]+((' | source '+str(url.urlparse(e.url).hostname)) if isinstance(e,urllib.error.HTTPError) else '');print('UNAVAILABLE',symbol,failed[symbol],flush=True)
             state['scan_progress']['attempted']+=1
             if store and state['scan_progress']['attempted']%50==0:store.save()
     state['scan_progress'].update({'complete':True,'finished_at':datetime.now(IST).isoformat(),'verified':len(checked),'unavailable':len(failed),'excluded':len(excluded)})
     state['retry_symbols']=list(failed);state['coverage']=coverage;state['last_batch']={'date':now.isoformat(),'checked':checked,'failed':failed,'matching':matches,'source_errors':source_errors,'universe_size':len(symbols),'full_universe_attempted':True}
     state['mf_coverage']={'scheme_stock_rows':mf_schemes,'pages':mf_pages,'buying_amc_ids':sorted(amc_ids),'source':MF_API}
-    sent=0
+    sent=sent_earlier
     if store:
-        if verify_private_destination()!=destination:raise ValueError('Private destination changed during scan')
         store.save()
-        while state['pending'] and sent<100:
-            item=state['pending'][0]
-            response=json.loads(request('https://api.telegram.org/bot'+os.environ['BOT_TOKEN'].strip()+'/sendMessage',{'chat_id':os.environ['CHAT_ID'].strip(),'text':item['text'],'link_preview_options':{'is_disabled':True}}))
-            if not response.get('ok'):raise ValueError('Telegram delivery rejected')
-            state['delivered'].append(item['id']);state['pending'].pop(0);store.save();sent+=1;time.sleep(1.1)
+        sent+=deliver_pending(store,destination,max(0,100-sent))
     summary=f'Full universe attempted {len(symbols)}/{len(symbols)}; verified {len(checked)}; excluded cap<=500Cr {len(excluded)}; unavailable {len(failed)}; matching stocks {len(matches)}; sent {sent}; waiting {len(state["pending"])}.'
     print(summary,flush=True)
     report={'summary':summary,'progress':state['scan_progress'],'coverage':coverage,'mf_coverage':state['mf_coverage'],'last_batch':state['last_batch'],'stocks':{s:state['records'][s] for s in checked if s in state['records']}}

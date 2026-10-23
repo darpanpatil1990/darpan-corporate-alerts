@@ -106,8 +106,9 @@ def trade_rows(html,kind,symbols,today,source):
     action=col({'trade type','transaction type','type','transaction','acquisition / disposal','acquisition/disposal','mode of acquisition','mode','buy/sell','buy / sell'})
     buyer=col({'client name','client','name','person','acquirer name','acquirer','name of acquirer','name of person','person name'})
     dated=col({'date','trade date','transaction date','acquisition date','disclosure date'})
-    quantity=col({'quantity','shares','no. of shares','no of shares','securities acquired/disposed','shares traded'})
-    if None in (action,buyer,dated,quantity):raise ValueError('Unrecognised trade columns: '+','.join(heads))
+    quantity=col({'quantity','shares','no. of shares','no of shares','securities acquired/disposed','shares traded','qty.','qty','number of shares','no. of securities'})
+    measure=col({'value','percent'})
+    if None in (action,buyer,dated) or quantity is None and measure is None:raise ValueError('Unrecognised trade columns: '+','.join(heads))
     output=[]
     for row in table.select('tbody tr'):
         cells=row.find_all(['td','th'],recursive=False)
@@ -117,9 +118,17 @@ def trade_rows(html,kind,symbols,today,source):
         links=[url.unquote(a['href'].split('/company/',1)[1].split('/')[0]) for a in row.select('a[href*="/company/"]')]
         syms=set(links)&set(symbols)
         if len(syms)!=1:continue
-        dt=day(text[dated]);q=Decimal(text[quantity].replace(',',''))
-        if not 0<q or not q.is_finite() or not 0<=(today-dt).days<=45:continue
-        output.append((syms.pop(),{'kind':kind+' disclosed acquisition','buyer':text[buyer],'start':dt.isoformat(),'end':dt.isoformat(),'qty':str(q),'source':source,'caveat':'Disclosed acquisition; buyer category not inferred from name.'}))
+        dt=day(text[dated])
+        if not 0<=(today-dt).days<=45:continue
+        item={'kind':kind+' disclosed acquisition','buyer':text[buyer],'start':dt.isoformat(),'end':dt.isoformat(),'source':source,'caveat':'Disclosed acquisition; buyer category not inferred from name.'}
+        if quantity is not None:
+            q=Decimal(text[quantity].replace(',',''))
+            if not q.is_finite() or q<=0:continue
+            item['qty']=str(q)
+        else:
+            item['reported_measure']=heads[measure]+': '+text[measure]
+            item['caveat']+=' Share quantity not provided on this source page; value/percent is shown exactly as reported.'
+        output.append((syms.pop(),item))
     return output
 
 def price_rows(obj,symbol,now):
@@ -228,7 +237,7 @@ def main():
                     if identity not in state['delivered'] and identity not in {p['id'] for p in state['pending']}:
                         lines=['Institutional evidence + HTF demand',symbol+' | completed close INR '+str(round(stock['cmp'],2))+' | '+stock['asof'],f"{z['tf']} demand: {z['d']:.2f}–{z['p']:.2f} | formed {z['date']}",f"Current visit since {z['latestTouch']} | tests {z['testEpisodes']}",'First return' if z['firstReturn'] else 'Previously tested HTF context — confirmation review required']
                         for e in items[:3]:
-                            lines.extend([e['kind']+' | '+e['buyer'],e['start']+' → '+e['end']+' | quantity '+str(e['qty'])+((' | increase '+str(e['change'])) if 'change' in e else ''),e['caveat'],e['source']])
+                            lines.extend([e['kind']+' | '+e['buyer'],e['start']+' → '+e['end']+' | quantity '+str(e.get('qty','not provided'))+((' | increase '+str(e['change'])) if 'change' in e else '')+(' | reported '+e['reported_measure'] if e.get('reported_measure') else ''),e['caveat'],e['source']])
                         lines.extend(['Demand Lab v31 OHLC-derived zone; no manual marking inferred.','Daily completed close; this is not an intraday trigger.','Price: Yahoo Finance | https://finance.yahoo.com/quote/'+url.quote(symbol+'.NS',safe='')+'/history/'])
                         state['pending'].append({'id':identity,'text':'\n'.join(lines)[:3950]})
             state['records'][symbol]=stock;checked.append(symbol);print('CHECKED',symbol,'inside HTF zones',len(stock['zones']),'matched',len(stock['evidence']),flush=True)

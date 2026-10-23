@@ -130,7 +130,10 @@ def merge_charts(base,recent):
 def prices(symbol):
     stem='https://query1.finance.yahoo.com/v8/finance/chart/'+url.quote(symbol+'.NS',safe='')
     def history():return json.loads(read_bytes(stem+'?interval=1d&period1=946684800&period2='+str(int(time.time()))+'&events=splits'))
+    cache_file=CACHE/'prices'/(symbol+'.json.gz')
+    had_fresh_cache=cache_file.exists() and 0<=time.time()-cache_file.stat().st_mtime<18*3600
     base=cached_json('prices',symbol,18*3600,history)
+    if not had_fresh_cache:return base,stem
     recent=json.loads(read_bytes(stem+'?interval=1d&range=5d&events=splits'))
     return merge_charts(base,recent),stem
 

@@ -9,6 +9,14 @@ class RuntimeTests(unittest.TestCase):
  def test_quantity_not_weight_and_identical_month_duplicates(self):
   items,ids=s.mf_page_items(self.mf(),'INE000000001',s.day('2026-10-23'))
   self.assertEqual(items[0]['change'],20);self.assertEqual(items[0]['end'],'2026-09-30');self.assertEqual(ids,{'22:INF000000001'})
+ def test_zero_provider_delta_with_repeated_months_is_recomputed(self):
+  d=self.mf();d['data'][0][6]=0
+  items,_=s.mf_page_items(d,'INE000000001',s.day('2026-10-23'))
+  self.assertEqual(items[0]['change'],20)
+ def test_distinct_scheme_options_are_not_combined(self):
+  d=self.mf();r=copy.deepcopy(d['data'][0]);r[3]='INF000000002';d['data'].append(r)
+  items,ids=s.mf_page_items(d,'INE000000001',s.day('2026-10-23'))
+  self.assertEqual(len(ids),2);self.assertEqual(len(items),2)
  def test_conflicting_duplicate_rejected(self):
   d=self.mf();d['data'][0][4]='120|119|100|100'
   with self.assertRaises(ValueError):s.mf_page_items(d,'INE000000001',s.day('2026-10-23'))

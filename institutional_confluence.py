@@ -172,13 +172,36 @@ class Store:
         if self.sha:data['sha']=self.sha
         self.sha=json.loads(request(self.endpoint,data,self.token,'PUT'))['content']['sha']
 
+def verify_private_destination():
+    """Never send these alerts to a group/channel or a different named bot."""
+    endpoint='https://api.telegram.org/bot'+os.environ['BOT_TOKEN'].strip()+'/'
+    me=json.loads(request(endpoint+'getMe'))
+    if not me.get('ok') or not me.get('result',{}).get('is_bot'):
+        raise ValueError('Telegram bot identity could not be verified')
+    bot=me['result']
+    print('Alert bot: '+bot.get('first_name','')+' (@'+bot.get('username','')+')',flush=True)
+    expected='darpan stock alerts'
+    if ' '.join(bot.get('first_name','').split()).casefold()!=expected:
+        raise ValueError('Configured bot does not match Darpan Stock Alerts; no alerts sent')
+    chat=json.loads(request(endpoint+'getChat',{'chat_id':os.environ['CHAT_ID'].strip()}))
+    if not chat.get('ok') or chat.get('result',{}).get('type')!='private':
+        raise ValueError('Private chat required: group/channel delivery blocked; no alerts sent')
+    print('Destination verified: private chat. Group/channel delivery blocked.',flush=True)
+    return hashlib.sha256((str(bot['id'])+'|'+str(chat['result']['id'])).encode()).hexdigest()
+
 def main():
     now=datetime.now(IST);today=now.date();dry='--dry-run' in sys.argv
+    destination=None if dry else verify_private_destination()
     raw=request(UNIVERSE_URL);symbols=universe_from_csv(raw)
     isin_map={r['ISIN Code'].strip():r['Symbol'].strip() for r in csv.DictReader(io.StringIO(raw))}
     store=None if dry else Store('institutional-confluence-state.json')
     if store:store.read()
     state=store.state if store else {'cursor':0,'records':{},'pending':[],'delivered':[]}
+    if destination:
+        state['destination']={'fingerprint':destination,'bot_name':'Darpan Stock Alerts','chat_type':'private'}
+        notice='private-destination-verified:'+destination
+        if notice not in state['delivered'] and notice not in {p['id'] for p in state['pending']}:
+            state['pending'].insert(0,{'id':notice,'text':'Darpan Stock Alerts: Institutional evidence + Monthly / Quarterly / Half-yearly / Yearly demand-zone alerts are connected to this private bot chat. Group/channel delivery is blocked. This is a connection confirmation, not a stock signal.'})
     errors=[];coverage={};evidence={}
     cache=None if dry else Store('mf-nippon-evidence.json')
     if cache:cache.read()
@@ -249,6 +272,8 @@ def main():
     state['coverage']=coverage;state['last_batch']={'date':now.isoformat(),'checked':checked,'failed':failed,'matching':list(dict.fromkeys(matches)),'source_errors':errors}
     sent=0
     if store:
+        if verify_private_destination()!=destination:
+            raise ValueError('Telegram destination changed during scan; delivery stopped')
         store.save()
         while state['pending'] and sent<15:
             item=state['pending'][0]

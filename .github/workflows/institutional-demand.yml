@@ -13,19 +13,31 @@ jobs:
     name: Institutional buying and HTF demand
     if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/cache/restore@v4
+        with:
+          path: .scanner-cache
+          key: scanner-history-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: scanner-history-${{ runner.os }}-
       - name: Install parsers
         run: pip install beautifulsoup4==4.14.3 openpyxl==3.1.5 xlrd==2.0.2
       - name: Verify evidence matching
-        run: python -m unittest test_institutional_confluence.py test_company_holdings.py
+        run: python -m unittest test_institutional_confluence.py test_company_holdings.py test_scanner_runtime.py
       - name: Scan and deliver dated confluence alerts
-        run: python institutional_confluence.py
+        run: python scanner_runtime.py
         env:
           GH_TOKEN: ${{ github.token }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.INSTITUTIONAL_PRIVATE_CHAT_ID }}
           SCREENER_EMAIL: ${{ secrets.SCREENER_EMAIL }}
           SCREENER_PASSWORD: ${{ secrets.SCREENER_PASSWORD }}
-          CONFLUENCE_BATCH_SIZE: '12'
+          SCANNER_WORKERS: '6'
+
+      - name: Preserve public source cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .scanner-cache
+          key: scanner-history-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}

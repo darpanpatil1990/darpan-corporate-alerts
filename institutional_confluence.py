@@ -172,30 +172,6 @@ class Store:
         if self.sha:data['sha']=self.sha
         self.sha=json.loads(request(self.endpoint,data,self.token,'PUT'))['content']['sha']
 
-def recover_private_chat(endpoint):
-    """Match only the user's supplied /start evidence; never print private IDs."""
-    try:
-        updates=json.loads(request(endpoint+'getUpdates'))
-        candidates=set()
-        for event in updates.get('result',[]):
-            msg=event.get('message',{});chat=msg.get('chat',{})
-            if chat.get('type')!='private' or chat.get('id')!=msg.get('from',{}).get('id'):continue
-            text=msg.get('text','')
-            at=datetime.fromtimestamp(msg.get('date',0),IST)
-            screenshot_start=text=='/start' and at.strftime('%Y-%m-%d %H:%M')=='2026-10-22 16:27'
-            fresh_start=text=='/start DarpanPrivate_23Oct_A7F9'
-            if screenshot_start or fresh_start:candidates.add(chat['id'])
-        print('PRIVATE_RECIPIENT_MATCHES:',len(candidates),flush=True)
-        if len(candidates)!=1:return
-        import tempfile
-        public_key='-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA14RQ2Pd8+6aE/Z5buRFO\nGMCTzPZgPKJjfxIUUNkZMhJuZ8wlwlcQno42p1JdaiG/FL9phmAWWtbzSVqdLoXx\n4TENBAy6TKL/w1pPHpDzY4ibWeWp1OdDwhRpKieYRMNrg98tgONxAjtQu9tFqoMA\nrm8PubDD0utC9bHsX3tmR4yURqEBxPO8gikJi42M/sqICZsIS/lH7NaBPMAnhFjv\nNa82dN+AwB6d85KKgHepKlHsCKrghcSXyEU+drqp9YA8nzsr2q6i7GS1wM5Ucecg\n96jAtl7Jie0RKf4H+9NAHQmIpUtSa3Gw7mbBjI5B78Yw+bc1+Gd2PxYuVRAuExHg\neQIDAQAB\n-----END PUBLIC KEY-----\n'
-        with tempfile.TemporaryDirectory() as directory:
-            path=Path(directory)/'recipient-public.pem';path.write_text(public_key)
-            result=subprocess.run(['openssl','pkeyutl','-encrypt','-pubin','-inkey',str(path),'-pkeyopt','rsa_padding_mode:oaep','-pkeyopt','rsa_oaep_md:sha256'],input=str(next(iter(candidates))).encode(),capture_output=True,check=True,timeout=15)
-        print('PRIVATE_RECIPIENT_ENCRYPTED:',base64.b64encode(result.stdout).decode(),flush=True)
-    except Exception as error:
-        print('PRIVATE_RECIPIENT_LOOKUP_UNAVAILABLE:',type(error).__name__,flush=True)
-
 def verify_private_destination():
     """Never send these alerts to a group/channel or a different named bot."""
     endpoint='https://api.telegram.org/bot'+os.environ['BOT_TOKEN'].strip()+'/'
@@ -205,11 +181,10 @@ def verify_private_destination():
     bot=me['result']
     print('Alert bot: '+bot.get('first_name','')+' (@'+bot.get('username','')+')',flush=True)
     expected='darpan stock alerts'
-    if ' '.join(bot.get('first_name','').split()).casefold()!=expected:
+    if ' '.join(bot.get('first_name','').split()).casefold()!=expected or bot.get('username','').casefold()!='darpandemandalerts_bot':
         raise ValueError('Configured bot does not match Darpan Stock Alerts; no alerts sent')
     chat=json.loads(request(endpoint+'getChat',{'chat_id':os.environ['CHAT_ID'].strip()}))
     if not chat.get('ok') or chat.get('result',{}).get('type')!='private':
-        recover_private_chat(endpoint)
         raise ValueError('Private chat required: group/channel delivery blocked; no alerts sent')
     print('Destination verified: private chat. Group/channel delivery blocked.',flush=True)
     return hashlib.sha256((str(bot['id'])+'|'+str(chat['result']['id'])).encode()).hexdigest()
@@ -222,6 +197,13 @@ def main():
     store=None if dry else Store('institutional-confluence-state.json')
     if store:store.read()
     state=store.state if store else {'cursor':0,'records':{},'pending':[],'delivered':[]}
+    new_private_destination=bool(destination and state.get('destination',{}).get('fingerprint')!=destination)
+    if new_private_destination:
+        previous=state.get('destination',{}).get('fingerprint','legacy')
+        state.setdefault('delivery_history',{})[previous]=state['delivered']
+        state['delivered']=state['delivery_history'].get(destination,[])
+        replay=[symbol for symbol,record in state['records'].items() if record.get('evidence')]
+        state['retry_symbols']=list(dict.fromkeys(replay+state.get('retry_symbols',[])))
     if destination:
         state['destination']={'fingerprint':destination,'bot_name':'Darpan Stock Alerts','chat_type':'private'}
         notice='private-destination-verified:'+destination
@@ -265,7 +247,7 @@ def main():
     cursor=state['cursor']%len(symbols);limit=min(25,max(1,int(os.environ.get('CONFLUENCE_BATCH_SIZE','12'))))
     batch=[symbols[(cursor+i)%len(symbols)] for i in range(limit)];checked=[];failed=[];matches=[]
     # Revisit symbols that have dated evidence first, then progress across the universe.
-    retry=state.get('retry_symbols',[])[:limit//3]
+    retry=state.get('retry_symbols',[])[:limit if new_private_destination else limit//3]
     batch=list(dict.fromkeys(retry+batch))[:limit]
     for symbol in batch:
         try:
@@ -311,6 +293,7 @@ def main():
     if os.environ.get('GITHUB_STEP_SUMMARY'):
         with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
             f.write('## Institutional buying evidence + higher-timeframe demand\n\n'+summary+'\n\nMonthly / Quarterly / Half Yearly / Yearly zones from Demand Lab v31. Completed daily OHLC, not intraday. Tested zones are context requiring entry confirmation.\n\n')
+            f.write('Delivery: Darpan Stock Alerts (@DarpanDemandAlerts_bot), verified private chat only. Group/channel delivery is blocked.\n\n')
             for k,v in coverage.items():f.write('- '+k+': '+v+'\n')
             f.write('\nQuarterly FII/DII ownership remains separate and never triggers a same-day buying claim. MF quantity increases can include non-trade changes; known splits suppress confluence. Full AMC coverage is not available.\n\n')
             for s in checked:

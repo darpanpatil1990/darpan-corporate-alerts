@@ -28,8 +28,33 @@ def request(address, payload=None, token=None, method=None):
         headers['Content-Type'] = 'application/json'
     req = urllib.request.Request(address, data=json.dumps(payload).encode() if payload is not None else None,
                                  headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=20) as response:
-        return response.read().decode('utf-8-sig')
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(req, timeout=20) as response:
+                return response.read().decode('utf-8-sig')
+        except urllib.error.HTTPError as error:
+            # Retry only transient reads, never writes or Telegram delivery.
+            if payload is not None or attempt or error.code not in (429, 500, 502, 503, 504):
+                raise
+            delay = error.headers.get('Retry-After', '8')
+            if not delay.isdigit() or int(delay) > 30:
+                raise
+            time.sleep(max(1, int(delay)))
+
+
+def read_company(symbol):
+    address = 'https://www.screener.in/company/' + urllib.parse.quote(symbol, safe='') + '/'
+    try:
+        html = request(address)
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            raise
+        address += 'consolidated/'
+        html = request(address)
+    record = parse_company(html, symbol)
+    if record:
+        record['source'] = address + '#shareholding'
+    return record
 
 
 def universe_from_csv(text):
@@ -180,14 +205,20 @@ def main():
         store.read()
         state = store.state
     cursor = state['cursor'] % len(symbols)
-    batch = (symbols + symbols)[cursor:cursor + limit]
+    retries = [s for s in state.get('retry_symbols', state.get('last_batch', {}).get('failed', [])) if s in symbols]
+    batch = list(dict.fromkeys(retries))[:limit // 2]
+    consumed = 0
+    while len(batch) < limit:
+        symbol = symbols[(cursor + consumed) % len(symbols)]
+        consumed += 1
+        if symbol not in batch:
+            batch.append(symbol)
     failed, checked, matches = [], [], []
     queued = {p['id'] for p in state['pending']}
     delivered = set(state['delivered'])
     for symbol in batch:
         try:
-            address = 'https://www.screener.in/company/' + urllib.parse.quote(symbol, safe='') + '/'
-            record = parse_company(request(address), symbol)
+            record = read_company(symbol)
             checked.append(symbol)
             if record:
                 initial = symbol not in state['records']
@@ -202,9 +233,11 @@ def main():
                 state['records'].pop(symbol, None)
         except Exception as error:
             failed.append(symbol)
-            print('UNAVAILABLE:', symbol, type(error).__name__, flush=True)
-        time.sleep(1)
-    state['cursor'] = (cursor + len(batch)) % len(symbols)
+            detail = ' HTTP ' + str(error.code) if isinstance(error, urllib.error.HTTPError) else ''
+            print('UNAVAILABLE:', symbol, type(error).__name__ + detail, flush=True)
+        time.sleep(3)
+    state['cursor'] = (cursor + consumed) % len(symbols)
+    state['retry_symbols'] = list(dict.fromkeys([s for s in retries if s not in batch] + failed))
     state['universe_checked_at'] = datetime.now(timezone.utc).isoformat()
     state['universe_source'] = UNIVERSE_URL
     state['last_batch'] = {'checked': checked, 'failed': failed, 'matching': [r['symbol'] for r in matches]}

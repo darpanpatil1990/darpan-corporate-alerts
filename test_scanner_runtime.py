@@ -160,6 +160,66 @@ class RuntimeTests(unittest.TestCase):
   with patch.object(s,'cached_json',side_effect=lambda f,k,t,loader:loader()),patch.object(s,'read_bytes',return_value=json.dumps(d).encode()):
    with self.assertRaises(ValueError):s.mf_for_stock('INE000000001',s.day('2026-10-23'))
 
+class NseAcquisitionTests(unittest.TestCase):
+ def fixture(self,**changes):
+  import exchange_disclosures as n
+  values={'buyer':'Disclosed Buyer','instrument':'Equity','category':'Promoter','action':'Buy','qty':'1000','start':'2026-10-20','end':'2026-10-21','mode':'Market Purchase','venue':'NSE'}
+  values.update(changes)
+  facts=''.join(f'<{n.FIELDS[k]} contextRef="Disclosure1">{v}</{n.FIELDS[k]}>' for k,v in values.items())
+  blob=('<xbrl><Symbol contextRef="MainI">TEST</Symbol><ISINCode contextRef="MainI">INE000000001</ISINCode>'+facts+'</xbrl>').encode()
+  filing={'symbol':'TEST','appId':'1','broadcastDateTime':'23-Oct-2026 21:18:34','xmlFileName':'https://nsearchives.nseindia.com/corporate/xbrl/test.xml'}
+  return n,blob,filing
+ def test_xbrl_transaction_dates_are_separate_from_later_publication(self):
+  n,blob,filing=self.fixture();result=n.parse_pit(blob,filing,'INE000000001')
+  event=result['events'][0]
+  self.assertEqual(event['start'],'2026-10-20');self.assertEqual(event['end'],'2026-10-21')
+  self.assertEqual(event['reported_at'],'23-Oct-2026 21:18:34');self.assertEqual(event['buyer_category'],'Promoter')
+ def test_gift_allotment_warrants_and_sales_are_excluded(self):
+  for changed in ({'mode':'Gift'},{'mode':'Preferential Offer'},{'instrument':'Warrant'},{'action':'Sell'}):
+   n,blob,filing=self.fixture(**changed)
+   self.assertFalse(n.parse_pit(blob,filing,'INE000000001')['events'])
+ def test_derivative_only_disclosure_is_verified_without_inventing_equity_buy(self):
+  n,blob,filing=self.fixture(instrument='Derivative')
+  blob=blob.replace(b'<SecuritiesAcquiredOrDisposedTransactionType contextRef="Disclosure1">Buy</SecuritiesAcquiredOrDisposedTransactionType>',b'')
+  parsed=n.parse_pit(blob,filing,'INE000000001')
+  self.assertEqual(parsed['contexts'],1);self.assertFalse(parsed['events']);self.assertEqual(parsed['excluded']['Not equity/REIT/InvIT units'],1)
+ def test_wrong_isin_future_dates_conflicting_facts_and_invalid_quantity_fail(self):
+  n,blob,filing=self.fixture()
+  with self.assertRaises(ValueError):n.parse_pit(blob,filing,'INE000000002')
+  for changed in ({'end':'2026-10-24'},{'start':'2026-10-22'},{'qty':'1.5'}):
+   n,blob,filing=self.fixture(**changed)
+   with self.assertRaises(ValueError):n.parse_pit(blob,filing,'INE000000001')
+  n,blob,filing=self.fixture();blob=blob.replace(b'</xbrl>',b'<ISINCode contextRef="MainI">INE000000002</ISINCode></xbrl>')
+  with self.assertRaises(ValueError):n.parse_pit(blob,filing,'INE000000001')
+ def test_whole_transaction_range_must_fall_inside_zone_visit(self):
+  n,blob,filing=self.fixture();event=n.parse_pit(blob,filing,'INE000000001')['events'][0]
+  self.assertFalse(s.acquisition_overlaps({'latestTouch':'2026-10-21'},event,'2026-10-23',[]))
+  self.assertTrue(s.acquisition_overlaps({'latestTouch':'2026-10-20'},event,'2026-10-23',[]))
+ def test_second_publication_of_same_purchase_is_not_another_alert(self):
+  n,blob,filing=self.fixture();event=n.parse_pit(blob,filing,'INE000000001')['events'][0]
+  duplicate=dict(event,source='https://nsearchives.nseindia.com/corporate/xbrl/revision.xml',reported_at='24-Oct-2026 12:00:00',filing_id='2:Disclosure1')
+  self.assertEqual(s.trade_identity('TEST',event),s.trade_identity('TEST',duplicate))
+  self.assertNotEqual(s.trade_identity('TEST',event),s.trade_identity('TEST',dict(event,qty='1001')))
+ def test_withdrawn_evidence_does_not_replay_a_delivered_subset(self):
+  n,blob,filing=self.fixture();event=n.parse_pit(blob,filing,'INE000000001')['events'][0]
+  other=dict(event,buyer='Another buyer');zone={'tf':'Monthly','date':'2026-09-01','latestTouch':'2026-10-19'}
+  old=[(zone,[event,other])];previous={'evidence':[{'zone':zone,'evidence':[event,other]}]}
+  delivered={s.match_identity('TEST',old)}
+  self.assertTrue(s.delivered_superset('TEST',previous,[(zone,[event])],delivered))
+  self.assertFalse(s.delivered_superset('TEST',previous,[(zone,[dict(event,qty='1001')])],delivered))
+ def test_latest_revision_supersedes_original_filing(self):
+  n,blob,old=self.fixture();new=dict(old,appId='2',prevAppId='1',xmlFileName='https://nsearchives.nseindia.com/corporate/xbrl/revision.xml');old['prevAppId']=None
+  parsed=n.parse_pit(blob,new,'INE000000001');calls=[]
+  def fetch(target):return json.dumps({'data':[] if 'invitsreits' in target else [old,new]}).encode()
+  def cached(folder,key,ttl,loader):calls.append(key);return parsed
+  events,status=n.load('Insider',{'TEST':'INE000000001'},s.day('2026-10-24'),fetch,cached)
+  self.assertEqual(status['selected_filings'],1);self.assertEqual(status['superseded_filings'],1);self.assertEqual(len(calls),1);self.assertEqual(len(events),1)
+ def test_sast_actual_date_and_mode_are_validated(self):
+  import exchange_disclosures as n
+  row={'symbol':'TEST','acqSaleType':'Acquisition','acquisitionMode':'Open Market','acqType':'Equity shares','acquirerDate':'20-OCT-2026 to 21-OCT-2026','sysTime':'23-Oct-2026 17:05','noOfShareAcq':'1,000','attachement':'https://nsearchives.nseindia.com/corporate/test.zip','acquirerName':'Disclosed Buyer','application_no':'1','promoterType':'Y'}
+  events,status=n.parse_sast([row,dict(row,acquisitionMode='Inter-se transfer')],{'TEST':'INE000000001'},s.day('2026-10-24'))
+  self.assertFalse(status['errors']);self.assertEqual(len(events),1);self.assertEqual(events[0][1]['qty'],'1000');self.assertEqual(events[0][1]['end'],'2026-10-21')
+
 class UniverseRecoveryTests(unittest.TestCase):
  def fixture(self):
   now=datetime(2026,10,24,17,tzinfo=s.IST)

@@ -160,6 +160,36 @@ class RuntimeTests(unittest.TestCase):
   with patch.object(s,'cached_json',side_effect=lambda f,k,t,loader:loader()),patch.object(s,'read_bytes',return_value=json.dumps(d).encode()):
    with self.assertRaises(ValueError):s.mf_for_stock('INE000000001',s.day('2026-10-23'))
 
+class UniverseRecoveryTests(unittest.TestCase):
+ def fixture(self):
+  now=datetime(2026,10,24,17,tzinfo=s.IST)
+  members={f'TEST{i}':f'INE{i:09d}' for i in range(500)}
+  state={'last_batch':{'date':(now-timedelta(days=1)).isoformat(),'checked':list(members)+['DUMMYHEG'],'failed':{},'excluded':{'DUMMYHEG':'Official index placeholder without a tradable stock ISIN/price history'},'full_universe_attempted':True},'records':{k:{'quality':{'stock_isin':v}} for k,v in members.items()}}
+  return now,members,state
+ def test_official_source_success_records_exact_membership_proof(self):
+  now,members,state=self.fixture();raw='Symbol,ISIN Code\n'+''.join(k+','+v+'\n' for k,v in members.items())
+  with patch.object(s,'read_bytes',return_value=raw.encode()):symbols,isin,status=s.load_universe(now,state)
+  self.assertEqual(isin,members);self.assertEqual(len(symbols),500);self.assertTrue(status['current_source_verified'])
+  self.assertEqual(state['universe_snapshot']['verified_at'],now.isoformat())
+ def test_redirect_outage_uses_dated_full_scan_without_renewing_its_age(self):
+  now,members,state=self.fixture();verified=state['last_batch']['date']
+  with patch.object(s,'read_bytes',side_effect=OSError('redirect loop')):
+   symbols,isin,status=s.load_universe(now,state)
+   _,_,later=s.load_universe(now+timedelta(days=1),state)
+  self.assertEqual(isin,members);self.assertFalse(status['current_source_verified']);self.assertEqual(status['original_member_count'],501)
+  self.assertEqual(status['omitted_placeholders'],['DUMMYHEG']);self.assertEqual(later['verified_at'],verified)
+  self.assertEqual(later['age_hours'],48)
+ def test_stale_or_incomplete_membership_never_silently_becomes_universe(self):
+  now,_,state=self.fixture();state['records'].pop('TEST3')
+  with patch.object(s,'read_bytes',side_effect=OSError('source unavailable')):
+   with self.assertRaises(ValueError):s.load_universe(now,state)
+  _,_,state=self.fixture();state['last_batch']['date']=(now-timedelta(days=8)).isoformat()
+  with patch.object(s,'read_bytes',side_effect=OSError('source unavailable')):
+   with self.assertRaises(ValueError):s.load_universe(now,state)
+ def test_unverified_or_duplicate_stock_identity_is_rejected(self):
+  _,members,_=self.fixture();members['TEST1']=members['TEST0']
+  with self.assertRaises(ValueError):s.validate_members(members)
+
 class ExchangeHistoryTests(unittest.TestCase):
  def test_official_close_replaces_entire_incomplete_daily_bar(self):
   import exchange_history as n

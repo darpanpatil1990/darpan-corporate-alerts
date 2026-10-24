@@ -99,6 +99,10 @@ class RuntimeTests(unittest.TestCase):
   state={'records':{'TEST':{'evidence':[{'zone':zone,'evidence':[item]}]}},'delivered':[old],'pending':[{'id':old,'text':'queued'}]}
   s.migrate_pagination_identities(state)
   self.assertIn(old,state['delivered']);self.assertIn(new,state['delivered']);self.assertEqual(state['pending'],[])
+ def test_missing_latest_close_cannot_trigger_current_price_alert(self):
+  now=datetime(2026,10,23,17,tzinfo=s.IST);d=self.chart(now);d['chart']['result'][0]['indicators']['quote'][0]['close'][-1]=None
+  _,_,quality=s.price_payload(d,'TEST',now)
+  self.assertEqual(quality['completed_asof'],'2026-10-22');self.assertFalse(quality['current_alerts_eligible'])
  def test_market_cap_requires_exact_stock_identity(self):
   d={'code':0,'data':[{'Sym':'TEST','Isin':'WRONG','Exch':'NSE','Mcap':99999},{'Sym':'RIGHT','Isin':'INE000000002','Exch':'NSE','Mcap':700}]}
   with patch.object(s,'cached_json',return_value=d):

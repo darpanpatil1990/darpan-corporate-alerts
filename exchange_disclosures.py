@@ -58,10 +58,12 @@ def parse_pit(blob,filing,isin):
     if symbols!={filing['symbol']} or identities!={isin}:raise ValueError('NSE XBRL stock identity mismatch')
     published=report_date(filing['broadcastDateTime']);events=[];excluded=Counter();contexts=0
     for context,facts in groups.items():
-        if FIELDS['action'] not in facts:continue
+        if FIELDS['instrument'] not in facts:continue
         contexts+=1;f={k:facts.get(v,'') for k,v in FIELDS.items()}
+        if not f['instrument']:raise ValueError('NSE instrument type unavailable')
         if f['instrument'].lower() not in ('equity','equity shares','units of reit','units of invit'):
             excluded['Not equity/REIT/InvIT units']+=1;continue
+        if not f['action']:raise ValueError('NSE equity transaction action unavailable')
         if f['action'].lower() not in ('buy','purchase','acquisition'):
             excluded['Not an acquisition']+=1;continue
         if f['mode'].lower() not in ('market purchase','open market','open market purchase'):
@@ -71,7 +73,7 @@ def parse_pit(blob,filing,isin):
         events.append({'kind':'Insider disclosed acquisition','stock_isin':isin,'buyer':f['buyer'],'buyer_category':f['category'],
          'start':start,'end':end,'qty':qty,'mode':f['mode'],'execution_venue':f['venue'] or 'Not supplied',
          'date_basis':'NSE transaction period','reported_at':filing['broadcastDateTime'],
-         'filing_id':str(filing['appId'])+':'+context,'source':filing['xmlFileName'],
+         'filing_id':str(filing['appId'])+':'+context,'source':filing['xmlFileName'],'submission_type':filing.get('typeOfSubmission','Original'),
          'caveat':'Completed open-market acquisition as disclosed in NSE XBRL. The transaction period is separate from its publication date; insider status does not establish an investment thesis.'})
     if not contexts:raise ValueError('NSE PIT transaction schema unavailable')
     return {'symbol':filing['symbol'],'isin':isin,'events':events,'contexts':contexts,'excluded':dict(excluded)}

@@ -151,19 +151,20 @@ def merge_charts(base,recent):
     events={**a.get('events',{}).get('splits',{}),**b.get('events',{}).get('splits',{})}
     return {'chart':{'result':[{'meta':b['meta'],'timestamp':timestamps,'indicators':{'quote':[quote]},'events':{'splits':events}}]}}
 
-def prices(symbol):
-    stem='https://query1.finance.yahoo.com/v8/finance/chart/'+url.quote(symbol+'.NS',safe='')
+def prices(symbol,exchange="NSE"):
+    suffix={'NSE':'.NS','BSE':'.BO'}[exchange];cache_key=symbol+('-BSE' if exchange=='BSE' else '')
+    stem='https://query1.finance.yahoo.com/v8/finance/chart/'+url.quote(symbol+suffix,safe='')
     def history():return json.loads(read_bytes(stem+'?interval=1d&period1=946684800&period2='+str(int(time.time()))+'&events=splits'))
-    cache_file=CACHE/'prices'/(symbol+'.json.gz')
+    cache_file=CACHE/'prices'/(cache_key+'.json.gz')
     had_fresh_cache=cache_file.exists() and 0<=time.time()-cache_file.stat().st_mtime<18*3600
-    base=cached_json('prices',symbol,18*3600,history)
+    base=cached_json('prices',cache_key,18*3600,history)
     if not had_fresh_cache:return base,stem
     recent=json.loads(read_bytes(stem+'?interval=1d&range=5d&events=splits'))
     return merge_charts(base,recent),stem
 
-def price_payload(obj,symbol,now):
+def price_payload(obj,symbol,now,exchange="NSE"):
     r=obj['chart']['result'][0];meta=r['meta'];now_ts=now.timestamp()
-    if meta.get('symbol')!=symbol+'.NS' or meta.get('currency')!='INR' or meta.get('dataGranularity')!='1d':raise ValueError('Price identity/currency/granularity mismatch')
+    if meta.get('symbol')!=symbol+{'NSE':'.NS','BSE':'.BO'}[exchange] or meta.get('currency')!='INR' or meta.get('dataGranularity')!='1d':raise ValueError('Price identity/currency/granularity mismatch')
     session=meta.get('currentTradingPeriod',{}).get('regular',{})
     start,end=session.get('start',0),session.get('end',0)
     qt=meta.get('regularMarketTime',0);qp=meta.get('regularMarketPrice')
@@ -282,11 +283,25 @@ def scan_stock(symbol,isin,now):
     if symbol.startswith('DUMMY') and isin.startswith('DUM'):return {'symbol':symbol,'excluded':'Official index placeholder without a tradable stock ISIN/price history'}
     cap=market_cap(symbol)
     if Decimal(cap['cap'])<=500:return {'symbol':symbol,'excluded':'Market cap <= INR 500 crore'}
-    data_symbol=cap.get('provider_symbol',symbol)
+    exchange='NSE'
+    data_symbol=symbol  # Keep the official ticker's established price history across provider renames.
     verified_alias=YAHOO_QUOTE_ALIASES.get(symbol)
     if verified_alias and verified_alias[0]==isin:data_symbol=verified_alias[1]
-    obj,source=prices(data_symbol);payload,splits,quality=price_payload(obj,data_symbol,now)
-    payload['symbol']=symbol;quality['data_symbol']=data_symbol;quality['stock_isin']=isin
+    try:
+        obj,source=prices(data_symbol);payload,splits,quality=price_payload(obj,data_symbol,now)
+    except (urllib.error.HTTPError,ValueError) as error:
+        if isinstance(error,urllib.error.HTTPError) and error.code!=404:raise
+        alternative=cap.get('provider_symbol',symbol)
+        if verified_alias and verified_alias[0]==isin:
+            # The same listed REIT has a separate BSE history. Never mix exchange candles.
+            data_symbol=symbol;exchange='BSE'
+            obj,source=prices(data_symbol,exchange);payload,splits,quality=price_payload(obj,data_symbol,now,exchange)
+        elif alternative!=data_symbol:
+            data_symbol=alternative
+            obj,source=prices(data_symbol);payload,splits,quality=price_payload(obj,data_symbol,now)
+        else:raise
+    payload['symbol']=symbol;quality['data_symbol']=data_symbol;quality['stock_isin']=isin;quality['exchange']=exchange
+    if exchange=='BSE':quality['fallback']='NSE daily history insufficient/unavailable; all demand bands and price use the separate BSE daily series.'
     run=subprocess.run(['node',str(ROOT/'zone_runner.cjs')],input=json.dumps(payload),capture_output=True,text=True,timeout=90,check=True)
     stock=json.loads(run.stdout)[0];stock.update({'price_source':source,'market_cap_cr':cap['cap'],'quality':quality,'evidence':[]})
     if stock['zones']:
@@ -299,7 +314,8 @@ def scan_stock(symbol,isin,now):
     return stock
 
 def alert_text(stock,matched):
-    quote=stock['quality']['quote'];lines=['Institutional evidence + HTF demand',stock['symbol']+((' (quote symbol '+stock['quality']['data_symbol']+')') if stock['quality'].get('data_symbol',stock['symbol'])!=stock['symbol'] else '')+' | '+quote['kind']+' INR '+str(round(stock['cmp'],2)), 'Price as of '+quote['asof']]
+    quote=stock['quality']['quote'];lines=['Institutional evidence + HTF demand',stock['symbol']+((' (quote symbol '+stock['quality']['data_symbol']+')') if stock['quality'].get('data_symbol',stock['symbol'])!=stock['symbol'] else '')+' | '+quote['kind']+' INR '+str(round(stock['cmp'],2)), 'Price as of '+quote['asof']+' | Exchange '+stock['quality'].get('exchange','NSE')]
+    if stock['quality'].get('fallback'):lines.append(stock['quality']['fallback'])
     buyers={}
     for z,items in matched:
         lines.append(f"{z['tf']} demand {z['d']:.2f}–{z['p']:.2f} | formed {z['date']} | {'First return' if z['firstReturn'] else 'Tested context; entry confirmation required'} | visit {z.get('latestTouch')}")

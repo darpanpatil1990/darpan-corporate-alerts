@@ -129,4 +129,41 @@ class RuntimeTests(unittest.TestCase):
   with patch.object(s,'cached_json',side_effect=lambda f,k,t,loader:loader()),patch.object(s,'read_bytes',return_value=json.dumps(d).encode()):
    with self.assertRaises(ValueError):s.mf_for_stock('INE000000001',s.day('2026-10-23'))
 
+class ExchangeHistoryTests(unittest.TestCase):
+ def test_official_close_replaces_entire_incomplete_daily_bar(self):
+  import exchange_history as n
+  now=datetime(2026,10,23,17,tzinfo=s.IST);chart=RuntimeTests().chart(now)
+  chart['chart']['result'][0]['indicators']['quote'][0]['close'][-1]=None
+  official={'INE000000001':[{'isin':'INE000000001','date':'2026-10-23','ohlc':[101,106,98,104],'source':'official-final'}]}
+  merged=n.augment(chart,'INE000000001',official)
+  payload,_,quality=s.price_payload(merged,'TEST',now)
+  self.assertEqual(payload['rows'][-1][:5],['2026-10-23',101,106,98,104])
+  self.assertTrue(quality['current_alerts_eligible']);self.assertEqual(quality['official_close_source'],'official-final')
+  chart['chart']['result'][0]['meta']['symbol']='TEST.BO'
+  with self.assertRaises(ValueError):n.augment(chart,'INE000000001',official)
+ def test_archive_exact_date_isin_and_final_close_not_last_price(self):
+  import exchange_history as n,io,zipfile
+  date=s.day('2026-10-23')
+  content='TradDt,Sgmt,Src,ISIN,TckrSymb,SctySrs,OpnPric,HghPric,LwPric,ClsPric,LastPric,SsnId\n2026-10-23,CM,NSE,INE000000001,TEST,RR,100,110,90,105,109,F1\n'
+  def pack(text):
+   b=io.BytesIO()
+   with zipfile.ZipFile(b,'w') as z:z.writestr('BhavCopy_NSE_CM_0_0_0_20261023_F_0000.csv',text)
+   return b.getvalue()
+  result=n.parse_archive(pack(content),date,{'TEST':'INE000000001'})
+  self.assertEqual(result['INE000000001']['ohlc'],[100,110,90,105])
+  self.assertFalse(n.parse_archive(pack(content),date,{'OTHER':'INE000000002'}))
+  with self.assertRaises(ValueError):n.parse_archive(pack(content.replace('2026-10-23','2026-10-22')),date,{'TEST':'INE000000001'})
+ def test_compressed_state_migration_preserves_pending_and_history(self):
+  import base64,gzip,lzma
+  state={'version':1,'records':{'TEST':{'source':'dated proof '*50000}},'pending':[{'id':'a','text':'unsent'}],'delivered':['old-delivery']}
+  store=object.__new__(s.CompactStore);store.state=copy.deepcopy(state)
+  captured=[]
+  with patch.object(s.Store,'save',lambda obj:captured.append(copy.deepcopy(obj.state))):store.save()
+  self.assertEqual(captured[0]['encoding'],'xz-base64');self.assertEqual(json.loads(lzma.decompress(base64.b64decode(captured[0]['data']))),state)
+  self.assertEqual(store.state,state)
+  for encoding,compress in [('gzip-base64',gzip.compress),('xz-base64',lzma.compress)]:
+   envelope={'version':1,'encoding':encoding,'data':base64.b64encode(compress(json.dumps(state).encode())).decode()}
+   with patch.object(s.Store,'read',lambda obj:setattr(obj,'state',envelope)):store.read()
+   self.assertEqual(store.state,state)
+
 if __name__=='__main__':unittest.main()

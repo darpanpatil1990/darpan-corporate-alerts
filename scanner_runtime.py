@@ -362,18 +362,33 @@ def match_identity(symbol,matched,canonical=True):
     return 'full-v2:'+hashlib.sha256(json.dumps(stable,sort_keys=True).encode()).hexdigest()
 
 def migrate_pagination_identities(state):
-    delivered=set(state['delivered']);mapping={}
+    delivered=set(state['delivered']);mapping={};rewrites={}
     for symbol,stock in state.get('records',{}).items():
         matched=[(e['zone'],e['evidence']) for e in stock.get('evidence',[])]
         if not matched:continue
-        old=match_identity(symbol,matched,False);new=match_identity(symbol,matched)
-        if old==new:continue
-        mapping[old]=new
-        if old in delivered and new not in delivered:state['delivered'].append(new);delivered.add(new)
-    seen=set(delivered);pending=[]
-    for item in state['pending']:
-        item=dict(item);item['id']=mapping.get(item['id'],item['id'])
+        old_ids={match_identity(symbol,matched,False),match_identity(symbol,matched)}
+        cleaned=[];removed=False
+        for zone,items in matched:
+            verified=[canonical_evidence(item) for item in items if not canonical_evidence(item).get('date_basis','').startswith('reporting date')]
+            removed=removed or len(verified)!=len(items)
+            if verified:cleaned.append((zone,verified))
+        stock['evidence']=[{'zone':zone,'evidence':items} for zone,items in cleaned]
+        new=match_identity(symbol,cleaned) if cleaned else None
+        for old in old_ids:
+            mapping[old]=new
+            if removed and new:rewrites[old]=alert_text(stock,cleaned)
+        if new and any(old in delivered for old in old_ids) and new not in delivered:
+            state['delivered'].append(new);delivered.add(new)
+    seen=set(delivered);pending=[];held=state.get('held_for_evidence_review',[]);held_ids={p['id'] for p in held}
+    for original in state['pending']:
+        item=dict(original);old=item['id'];item['id']=mapping.get(old,old)
+        uncertain=old not in mapping and any('\n'+kind+' disclosed acquisition |' in item.get('text','') for kind in ('Insider','SAST'))
+        if item['id'] is None or uncertain:
+            if old not in held_ids:held.append(dict(original,reason='Reporting date is not a verified transaction date'));held_ids.add(old)
+            continue
+        if old in rewrites:item['text']=rewrites[old]
         if item['id'] not in seen:pending.append(item);seen.add(item['id'])
+    if held:state['held_for_evidence_review']=held
     state['pending']=pending
 
 def alert_text(stock,matched):

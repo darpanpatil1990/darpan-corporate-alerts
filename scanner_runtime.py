@@ -281,10 +281,10 @@ def read_disclosures(kind,path,symbols,today,deadline):
             if len(seen)%25==0:print('DISCLOSURE',kind,'pages',len(seen),'rows',rows,'oldest',str(min(dates)) if dates else 'none',flush=True)
             descending=descending and all(a>=b for a,b in zip(dates,dates[1:])) and (last is None or not dates or last>=max(dates))
             if dates:last=min(dates)
-            records.extend(trade_rows(html,kind,symbols,today,BASE+url.urlparse(path).path))
+            records.extend((symbol,canonical_evidence(item)) for symbol,item in trade_rows(html,kind,symbols,today,BASE+url.urlparse(path).path))
             nxt=following_page(html,target)
             if nxt is None:reason='all available pages';break
-            if dates and max(dates)<cutoff and descending:reason='all pages through the 45-day acquisition window';break
+            if dates and max(dates)<cutoff and descending:reason='all pages through the 45-day source date window';break
             target=nxt;time.sleep(.15)
     except Exception as e:
         complete=False;reason=type(e).__name__+': '+str(e)[:160]
@@ -348,7 +348,14 @@ def canonical_evidence(item):
     item=dict(item);parsed=url.urlparse(item.get('source',''))
     if parsed.hostname=='www.screener.in' and parsed.path.startswith('/trades/'):
         item['source']=url.urlunparse(parsed._replace(query='',fragment=''))
+        if parsed.path.rstrip('/') in ('/trades/insiders','/trades/sast'):
+            item['date_basis']='reporting date; transaction date not supplied'
+            item['caveat']='Acquisition disclosure with source reporting date only. Transaction date and overlap with the zone visit are unverified; excluded from timed acquisition matches.'
     return item
+
+def acquisition_overlaps(zone,evidence,asof,splits):
+    if evidence.get('date_basis','').startswith('reporting date'):return False
+    return overlaps(zone,evidence,asof,splits)
 
 def match_identity(symbol,matched,canonical=True):
     stable=[symbol,[(z['tf'],z['date'],z.get('latestTouch'),sorted(hashlib.sha256(json.dumps(canonical_evidence(e) if canonical else e,sort_keys=True).encode()).hexdigest() for e in items)) for z,items in matched]]
@@ -428,6 +435,7 @@ def main():
                 kind=tasks[task]
                 try:
                     records,status=task.result();coverage[kind]=status
+                    if kind in ('Insider','SAST'):status.update({'date_basis':'Source reporting dates; actual transaction dates not supplied','timed_acquisition_matches_eligible':False})
                     if not status['complete']:source_errors.append(kind+': '+status['scope'])
                     for symbol,item in records:trade_evidence.setdefault(aliases.get(symbol,symbol),[]).append(item)
                 except Exception as e:source_errors.append(kind+': '+type(e).__name__+' '+str(e)[:160]);coverage[kind]={'complete':False,'error':str(e)[:160]}
@@ -463,7 +471,7 @@ def main():
                     evidence=mf+trade_evidence.get(symbol,[]);matched=[]
                     if not stock['quality'].get('current_alerts_eligible',True):suspended[symbol]={'validated_close_asof':stock['quality']['completed_asof'],'latest_source_quote_date':stock['quality']['latest_quote_date'],'reason':'A newer source session lacks a validated daily bar; current-price alerts are suspended.'}
                     for z in stock['zones'] if symbol not in suspended else []:
-                        items=[e for e in evidence if overlaps(z,e,stock['asof'],splits)]
+                        items=[e for e in evidence if acquisition_overlaps(z,e,stock['asof'],splits)]
                         if items:matched.append((z,items));stock['evidence'].append({'zone':z,'evidence':items})
                     if matched:
                         matches.append(symbol)

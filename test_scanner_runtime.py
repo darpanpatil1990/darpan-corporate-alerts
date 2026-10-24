@@ -287,4 +287,50 @@ class ExchangeHistoryTests(unittest.TestCase):
    with patch.object(s.Store,'read',lambda obj:setattr(obj,'state',envelope)):store.read()
    self.assertEqual(store.state,state)
 
+class AlertUpgradeTests(unittest.TestCase):
+ def stock(self):
+  return {'symbol':'TEST','asof':'2026-09-15','cmp':100,'price_source':'https://official.test/close','quality':{'stock_isin':'INE000000001','exchange':'NSE','quote':{'kind':'Close','asof':'2026-09-15'}},'zones':[]}
+ def zone(self):return {'tf':'Monthly','date':'2026-01-01','d':90,'p':110,'latestTouch':'2026-09-10','firstReturn':True,'testEpisodes':1}
+ def evidence(self):return {'kind':'MF monthly quantity increase','buyer':'Fund','amc_id':'1','start':'2026-08-31','end':'2026-09-30','qty':100,'change':20,'source':'https://scanx.trade/'}
+ def test_exchange_proof_not_hidden_by_many_fund_schemes(self):
+  items=[dict(self.evidence(),buyer='Fund '+str(i)) for i in range(20)]
+  items.append({'kind':'Insider acquisition','buyer':'Explicit buyer','buyer_category':'Promoter group','start':'2026-09-12','end':'2026-09-12','qty':500,'mode':'Market Purchase','date_basis':'NSE transaction period','reported_at':'2026-09-14','source':'https://nsearchives.nseindia.com/corporate/proof.xml'})
+  text=s.alert_text(self.stock(),[(self.zone(),items)])
+  self.assertIn('Explicit buyer',text);self.assertIn('Promoter group',text);self.assertIn('Published 2026-09-14',text);self.assertIn('proof.xml',text);self.assertIn('not confirmed same-day buys',text);self.assertLessEqual(len(text),3950)
+ def test_source_types_are_represented_before_second_same_type(self):
+  items=[dict(self.evidence(),buyer=str(i)) for i in range(6)]+[dict(self.evidence(),kind='Bulk acquisition',buyer='Bulk',amc_id=None)]
+  self.assertEqual(len({e['kind'] for e in s.display_evidence(items)[:2]}),2)
+ def test_only_delivered_match_is_migrated_and_watch_survives_lost_match(self):
+  stock=self.stock();matched=[(self.zone(),[self.evidence()])];stock['evidence']=[{'zone':z,'evidence':e} for z,e in matched]
+  state={'records':{'TEST':stock},'delivered':[]};s.migrate_delivered_watches(state);self.assertFalse(state.get('zone_watches'))
+  state['delivered']=[s.match_identity('TEST',matched)];s.migrate_delivered_watches(state);self.assertEqual(len(state['zone_watches']),1)
+  stock['evidence']=[];s.migrate_delivered_watches(state);self.assertEqual(len(state['zone_watches']),1)
+ def test_break_once_same_identity_only_and_not_on_failed_quote(self):
+  stock=self.stock();watch=s.alert_watches(stock,[(self.zone(),[])])[0];state={'delivered':[],'pending':[]};s.remember_watches(state,[watch])
+  event=dict(watch,close=89,breach_date='2026-09-30');stock['zone_breaks']=[event]
+  stock['quality']['current_alerts_eligible']=False;s.queue_zone_breaks(state,stock);self.assertEqual(state['pending'],[])
+  stock['quality']['current_alerts_eligible']=True;stock['quality']['stock_isin']='INE999999999';s.queue_zone_breaks(state,stock);self.assertEqual(state['pending'],[])
+  stock['quality']['stock_isin']=watch['stock_isin'];s.queue_zone_breaks(state,stock);s.queue_zone_breaks(state,stock);self.assertEqual(len(state['pending']),1)
+  self.assertIn('Completed Monthly candle',state['pending'][0]['text'])
+  state['delivered']=[state['pending'].pop()['id']];s.queue_zone_breaks(state,stock);self.assertEqual(state['pending'],[])
+ def test_watch_registered_only_after_successful_private_delivery(self):
+  stock=self.stock();watch=s.alert_watches(stock,[(self.zone(),[])])[0];store=Mock();store.state={'pending':[{'id':'match','text':'Research','watches':[watch]}],'delivered':[]}
+  with patch.object(s,'verify_private_destination',return_value='private'),patch.object(s,'request',return_value='{"ok":false}'),patch.dict(s.os.environ,{'BOT_TOKEN':'test','CHAT_ID':'test'}):
+   with self.assertRaises(ValueError):s.deliver_pending(store,'private')
+  self.assertFalse(store.state.get('zone_watches'))
+  with patch.object(s,'verify_private_destination',return_value='private'),patch.object(s,'request',return_value='{"ok":true}'),patch.object(s.time,'sleep'),patch.dict(s.os.environ,{'BOT_TOKEN':'test','CHAT_ID':'test'}):s.deliver_pending(store,'private')
+  self.assertIn(watch['id'],store.state['zone_watches'])
+ def test_timeframe_candle_close_required_not_wick_or_open_month(self):
+  import subprocess
+  script="const {monitorZones}=require('./zone_runner.cjs');process.stdout.write(JSON.stringify(monitorZones(JSON.parse(process.argv[1]))));"
+  watch=dict(self.zone(),id='watch',registered_asof='2026-09-15')
+  rows=[['2026-08-31',100,105,95,100],['2026-09-16',100,105,80,95],['2026-09-30',95,98,85,89],['2026-10-01',89,95,80,85]]
+  def check(asof,values=rows,missing=None):
+   payload={'rows':values,'asof':asof,'monitoredZones':[watch],'dropFirstAggregate':True,'missingDates':missing or []}
+   return json.loads(subprocess.check_output(['node','-e',script,json.dumps(payload)],text=True,cwd=s.ROOT))
+  self.assertEqual(check('2026-09-30'),[])
+  event=check('2026-10-01');self.assertEqual(event[0]['breach_date'],'2026-09-30');self.assertEqual(event[0]['close'],89)
+  self.assertEqual(check('2026-10-01',missing=['2026-09-20']),[])
+  rows[2][4]=91;self.assertEqual(check('2026-10-01'),[])
+
 if __name__=='__main__':unittest.main()

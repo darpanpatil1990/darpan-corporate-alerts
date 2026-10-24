@@ -87,6 +87,18 @@ class RuntimeTests(unittest.TestCase):
   d['chart']['result'][0]['meta']['symbol']='TEST.BO'
   payload,_,_=s.price_payload(d,'TEST',now,'BSE')
   self.assertEqual(payload['quote']['asof'],'2026-10-23')
+ def test_page_moves_do_not_create_new_alerts(self):
+  zone={'tf':'Monthly','date':'2026-08-01','latestTouch':'2026-09-01'}
+  item={'kind':'Bulk disclosed acquisition','buyer':'Named buyer','start':'2026-10-23','end':'2026-10-23','qty':'100','source':'https://www.screener.in/trades/bulk/?p=2'}
+  moved=dict(item,source='https://www.screener.in/trades/bulk/?p=3')
+  self.assertEqual(s.match_identity('TEST',[(zone,[item])]),s.match_identity('TEST',[(zone,[moved])]))
+  self.assertNotEqual(s.match_identity('TEST',[(zone,[item])]),s.match_identity('TEST',[(zone,[dict(item,qty='200')])]))
+ def test_pagination_migration_preserves_delivery_history(self):
+  zone={'tf':'Monthly','date':'2026-08-01','latestTouch':'2026-09-01'};item={'source':'https://www.screener.in/trades/bulk/?p=2','buyer':'Named buyer'}
+  old=s.match_identity('TEST',[(zone,[item])],False);new=s.match_identity('TEST',[(zone,[item])])
+  state={'records':{'TEST':{'evidence':[{'zone':zone,'evidence':[item]}]}},'delivered':[old],'pending':[{'id':old,'text':'queued'}]}
+  s.migrate_pagination_identities(state)
+  self.assertIn(old,state['delivered']);self.assertIn(new,state['delivered']);self.assertEqual(state['pending'],[])
  def test_market_cap_requires_exact_stock_identity(self):
   d={'code':0,'data':[{'Sym':'TEST','Isin':'WRONG','Exch':'NSE','Mcap':99999},{'Sym':'RIGHT','Isin':'INE000000002','Exch':'NSE','Mcap':700}]}
   with patch.object(s,'cached_json',return_value=d):

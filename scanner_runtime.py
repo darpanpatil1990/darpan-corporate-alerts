@@ -1,19 +1,21 @@
 """Full Nifty universe, dated multi-AMC evidence, public delayed quotes and safe delivery.
 External source omissions remain explicit; attempted coverage is never called verified data.
 """
-import base64, csv, gzip, hashlib, io, json, math, os, re, subprocess, sys, threading, time
+import base64, csv, gzip, hashlib, io, json, lzma, math, os, re, subprocess, sys, threading, time
 import urllib.error, urllib.parse as url, urllib.request as web
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from bs4 import BeautifulSoup
+from exchange_history import bootstrap as bootstrap_nse,augment as augment_nse
 from institutional_confluence import (Store, request, UNIVERSE_URL, universe_from_csv, IST,
     day, month_end, login, trade_rows, overlaps, verify_private_destination, BASE, TRADE_PATHS)
 
 MF_API='https://ow-static-scanx.dhan.co/staticscanx/mfpastholdingsbyisin'
 CAP_API='https://ow-scanx-analytics.dhan.co/customscan/fetchdt'
 CAP_LOOKUP={}
+OFFICIAL_NSE={}
 # Yahoo search identifies this NSE REIT series explicitly; bind the alias to its stock ISIN.
 YAHOO_QUOTE_ALIASES={'BAGMANE':('INE2OVN25015','BAGMANE-RR')}
 AMC_API='https://ow-static-scanx.dhan.co/staticscanx/amclist_v2'
@@ -180,18 +182,18 @@ def price_payload(obj,symbol,now,exchange="NSE"):
             if max(l-min(o,c),max(o,c)-h,l-h)>tol:invalid.append(dt.isoformat());continue
             h=max(h,o,c);l=min(l,o,c);rounding.append(dt.isoformat())
         row=[dt.isoformat(),o,h,l,c]
-        complete=dt<now.date() or (end and now_ts>=end+900 and datetime.fromtimestamp(end,IST).date()==dt)
+        complete=dt.isoformat() in obj.get('_official_final_dates',[]) or dt<now.date() or (end and now_ts>=end+900 and datetime.fromtimestamp(end,IST).date()==dt)
         if complete:closed.append(row)
         elif dt==now.date():current=row+[False]
     if len(closed)<60 or not 0<=(now.date()-day(closed[-1][0])).days<=10:raise ValueError('Insufficient or stale completed daily history')
     if closed[-1][0] in invalid:raise ValueError('Last completed price is invalid')
     rows=closed.copy();asof=closed[-1][0]
-    quote={'price':closed[-1][4],'kind':'Last completed close','asof':asof}
+    quote={'price':closed[-1][4],'kind':'NSE official final close' if asof in obj.get('_official_final_dates',[]) else 'Last completed close','asof':asof}
     if live and current:
         rows.append(current);asof=current[0]
         quote={'price':qp,'kind':'Live session quote (may be delayed)','asof':datetime.fromtimestamp(qt,IST).isoformat()}
     splits=[datetime.fromtimestamp(x['date'],IST).date().isoformat() for x in r.get('events',{}).get('splits',{}).values()]
-    return {'symbol':symbol,'timeframe':'Daily','rows':rows,'asof':asof,'quote':quote,'dropFirstAggregate':True,'missingDates':invalid},splits,{'invalid_rows':invalid,'rounding_repairs':rounding,'history_start':closed[0][0],'completed_asof':closed[-1][0],'quote':quote,'latest_quote_date':datetime.fromtimestamp(qt,IST).date().isoformat() if qt else None,'current_alerts_eligible':not any(d>asof for d in invalid) and (not qt or asof>=datetime.fromtimestamp(qt,IST).date().isoformat())}
+    return {'symbol':symbol,'timeframe':'Daily','rows':rows,'asof':asof,'quote':quote,'dropFirstAggregate':True,'missingDates':invalid},splits,{'invalid_rows':invalid,'rounding_repairs':rounding,'history_start':closed[0][0],'completed_asof':closed[-1][0],'quote':quote,'official_close_source':obj.get('_official_close_sources',{}).get(asof) if not live else None,'latest_quote_date':datetime.fromtimestamp(qt,IST).date().isoformat() if qt else None,'current_alerts_eligible':not any(d>asof for d in invalid) and (not qt or asof>=datetime.fromtimestamp(qt,IST).date().isoformat())}
 
 def following_page(html,current):
     soup=BeautifulSoup(html,'html.parser');parsed=url.urlparse(current);candidates=[]
@@ -225,13 +227,16 @@ def disclosure_day(cell):
         except ValueError:pass
     if len(dates)==1:return dates.pop()
     if dates:raise ValueError('Conflicting absolute disclosure dates')
-    metadata=[{k:str(e[k])[:80] for k in attributes if e.get(k)} for e in [cell]+list(cell.find_all(True))]
+    metadata=[{k:str(v)[:160] for k,v in e.attrs.items()} for e in [cell]+list(cell.find_all(True))]
     print('DISCLOSURE DATE ATTRIBUTES',metadata,flush=True)
     raise ValueError('Unrecognised disclosure date: '+candidates[0][:50])
 
 def disclosure_dates(html,normalize=False):
     soup=BeautifulSoup(html,'html.parser');table=soup.select_one('table#result_list') or soup.select_one('main table')
     if table is None:raise ValueError('Disclosure table unavailable')
+    if normalize:
+        exports=[a.get('href') for a in soup.select('a[href]') if 'export' in a.get_text(' ',strip=True).lower() or 'csv' in a.get_text(' ',strip=True).lower()]
+        if exports:print('DISCLOSURE PUBLIC EXPORT LINKS',exports,flush=True)
     heads=[h.get_text(' ',strip=True).lower() for h in table.select('thead th')]
     names={'date','trade date','transaction date','acquisition date','disclosure date'}
     index=next((i for i,h in enumerate(heads) if h in names),None)
@@ -286,15 +291,16 @@ def read_disclosures(kind,path,symbols,today,deadline):
 class CompactStore(Store):
     def read(self):
         super().read()
-        if self.state.get('encoding')=='gzip-base64':
-            raw=gzip.GzipFile(fileobj=io.BytesIO(base64.b64decode(self.state['data']))).read(20_000_001)
+        if self.state.get('encoding') in ('gzip-base64','xz-base64'):
+            decoder=lzma.LZMAFile(io.BytesIO(base64.b64decode(self.state['data']))) if self.state['encoding']=='xz-base64' else gzip.GzipFile(fileobj=io.BytesIO(base64.b64decode(self.state['data'])))
+            with decoder:raw=decoder.read(20_000_001)
             if len(raw)>20_000_000:raise ValueError('Expanded state size limit')
             self.state=json.loads(raw)
         if not all(isinstance(self.state.get(k),t) for k,t in [('records',dict),('pending',list),('delivered',list)]):raise ValueError('Delivery state invalid; refusing to reset history')
     def save(self):
         raw=json.dumps(self.state,separators=(',',':')).encode();original=self.state
         try:
-            if len(raw)>450000:self.state={'version':1,'encoding':'gzip-base64','data':base64.b64encode(gzip.compress(raw)).decode(),'last_batch':original.get('last_batch'),'destination':original.get('destination')}
+            if len(raw)>450000:self.state={'version':1,'encoding':'xz-base64','data':base64.b64encode(lzma.compress(raw)).decode(),'last_batch':original.get('last_batch'),'destination':original.get('destination')}
             super().save()
         finally:self.state=original
 
@@ -307,7 +313,7 @@ def scan_stock(symbol,isin,now=None):
     verified_alias=YAHOO_QUOTE_ALIASES.get(symbol)
     if verified_alias and verified_alias[0]==isin:data_symbol=verified_alias[1]
     try:
-        obj,source=prices(data_symbol);payload,splits,quality=price_payload(obj,data_symbol,now or datetime.now(IST))
+        obj,source=prices(data_symbol);obj=augment_nse(obj,isin,OFFICIAL_NSE);payload,splits,quality=price_payload(obj,data_symbol,now or datetime.now(IST))
     except (urllib.error.HTTPError,ValueError) as error:
         if isinstance(error,urllib.error.HTTPError) and error.code!=404:raise
         alternative=cap.get('provider_symbol',symbol)
@@ -317,11 +323,12 @@ def scan_stock(symbol,isin,now=None):
             obj,source=prices(data_symbol,exchange);payload,splits,quality=price_payload(obj,data_symbol,now or datetime.now(IST),exchange)
         elif alternative!=data_symbol:
             data_symbol=alternative
-            obj,source=prices(data_symbol);payload,splits,quality=price_payload(obj,data_symbol,now or datetime.now(IST))
+            obj,source=prices(data_symbol);obj=augment_nse(obj,isin,OFFICIAL_NSE);payload,splits,quality=price_payload(obj,data_symbol,now or datetime.now(IST))
         else:raise
     payload['symbol']=symbol;quality['data_symbol']=data_symbol;quality['stock_isin']=isin;quality['exchange']=exchange
     if exchange=='BSE':quality['fallback']='NSE daily history insufficient/unavailable; all demand bands and price use the separate BSE daily series.'
     run=subprocess.run(['node',str(ROOT/'zone_runner.cjs')],input=json.dumps(payload),capture_output=True,text=True,timeout=90,check=True)
+    if quality.get('official_close_source'):source=quality['official_close_source']
     stock=json.loads(run.stdout)[0];stock.update({'price_source':source,'market_cap_cr':cap['cap'],'quality':quality,'evidence':[]})
     if stock['zones']:
         try:
@@ -370,7 +377,7 @@ def alert_text(stock,matched):
         if 'reported_measure' in e:measure+=' | '+e['reported_measure']
         lines.extend([e['kind']+' | '+e['buyer'],e['start']+' → '+e['end']+' | '+measure,e['source']])
     if len(buyers)>4:lines.append(str(len(buyers)-4)+' additional qualifying scheme/acquisition records retained in scan state.')
-    lines.extend(['Month-end quantity change is not a verified purchase today. Known splits suppress monthly MF matches; other non-trade changes remain possible.','Demand Lab v31 OHLC-derived bands; no analyst overrides inferred. Public quotes may be delayed.','Price: Yahoo Finance. MF: ScanX dated monthly quantities. Disclosed acquisitions: Screener.'])
+    lines.extend(['Month-end quantity change is not a verified purchase today. Known splits suppress monthly MF matches; other non-trade changes remain possible.','Demand Lab v31 OHLC-derived bands; no analyst overrides inferred. Public quotes may be delayed.','Price: Yahoo Finance / NSE final bhavcopy, as labelled above. MF: ScanX dated monthly quantities. Disclosed acquisitions: Screener.'])
     return '\n'.join(lines)[:3950]
 
 def deliver_pending(store,destination,limit=100):
@@ -400,6 +407,12 @@ def main():
         cap_data,cap_status=load_scanx_caps(isin);CAP_LOOKUP.update(cap_data);coverage['Market cap']=cap_status
         print('MARKET CAPS exact official identities',len(cap_data),'/',len(isin),flush=True)
     except Exception as e:coverage['Market cap']={'source':CAP_API,'fallback':'Independent Screener identity checks','error':type(e).__name__+': '+str(e)[:120]}
+    try:
+        official,official_status=bootstrap_nse(datetime.now(IST),isin,read_bytes,CACHE)
+        OFFICIAL_NSE.update(official);coverage['NSE final OHLC']=official_status
+        print('NSE FINAL',official_status['latest_final_date'],'verified ISINs',official_status['verified_current_isins'],'REIT history',official_status['history_rows'],flush=True)
+        if official_status['history_errors']:source_errors.append('NSE archive history: '+str(len(official_status['history_errors']))+' unavailable files')
+    except Exception as e:coverage['NSE final OHLC']={'complete':False,'error':type(e).__name__+': '+str(e)[:160]};source_errors.append('NSE final OHLC: '+type(e).__name__)
     aliases={v['provider_symbol']:k for k,v in CAP_LOOKUP.items() if v['provider_symbol']!=k}
     trade_symbols=list(dict.fromkeys(symbols+list(aliases)))
     deadline=time.monotonic()+30*60

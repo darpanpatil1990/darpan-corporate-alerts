@@ -83,6 +83,24 @@ class RuntimeTests(unittest.TestCase):
   item=s.canonical_evidence({'kind':'Insider disclosed acquisition','buyer':'Reported buyer','start':'2026-10-23','end':'2026-10-23','source':'https://www.screener.in/trades/insiders/?p=2'})
   self.assertIn('reporting date',item['date_basis'])
   self.assertFalse(s.acquisition_overlaps({'latestTouch':'2026-10-22'},item,'2026-10-23',[]))
+ def test_reporting_date_queue_is_held_and_history_is_preserved(self):
+  evidence={'kind':'Insider disclosed acquisition','buyer':'Reported buyer','start':'2026-10-23','end':'2026-10-23','source':'https://www.screener.in/trades/insiders/'}
+  zone={'tf':'Monthly','date':'2026-09-01','latestTouch':'2026-10-22'}
+  old=s.match_identity('TEST',[(zone,[evidence])],False)
+  state={'records':{'TEST':{'evidence':[{'zone':zone,'evidence':[evidence]}]}},'pending':[{'id':old,'text':'unsent reporting-only evidence'}],'delivered':['prior-delivery']}
+  s.migrate_pagination_identities(state)
+  self.assertEqual(state['pending'],[]);self.assertEqual(state['delivered'],['prior-delivery'])
+  self.assertEqual(state['held_for_evidence_review'][0]['id'],old)
+ def test_removing_reporting_evidence_does_not_replay_already_delivered_match(self):
+  evidence={'kind':'Insider disclosed acquisition','buyer':'Reported buyer','start':'2026-10-23','end':'2026-10-23','source':'https://www.screener.in/trades/insiders/'}
+  bulk=dict(evidence,kind='Bulk disclosed acquisition',source='https://www.screener.in/trades/bulk/')
+  zone={'tf':'Monthly','date':'2026-09-01','latestTouch':'2026-10-22','d':90,'p':110,'firstReturn':True}
+  old=s.match_identity('TEST',[(zone,[evidence,bulk])],False)
+  stock={'symbol':'TEST','cmp':100,'quality':{'quote':{'kind':'Close','asof':'2026-10-23'}},'evidence':[{'zone':zone,'evidence':[evidence,bulk]}]}
+  state={'records':{'TEST':stock},'pending':[{'id':old,'text':'old combined match'}],'delivered':[old]}
+  s.migrate_pagination_identities(state)
+  new=s.match_identity('TEST',[(zone,[bulk])])
+  self.assertIn(old,state['delivered']);self.assertIn(new,state['delivered']);self.assertFalse(state['pending'])
  def test_later_page_failure_preserves_dated_acquisitions(self):
   html='<main><table><thead><tr><th>Company</th><th>Person</th><th>Date</th><th>Type</th><th>Value</th></tr></thead><tbody><tr><td><a href="/company/TEST/">TEST</a></td><td>Named acquirer</td><td>23 Oct 2026</td><td>Buy</td><td>10</td></tr></tbody></table><a rel="next" href="?p=2">Next</a></main>'
   with patch.object(s,'login',return_value=Mock()),patch.object(s,'disclosure_page',side_effect=[html,ValueError('Source unavailable')]),patch.object(s.time,'sleep'):

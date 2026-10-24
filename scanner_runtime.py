@@ -254,7 +254,7 @@ def read_disclosures(kind,path,symbols,today,deadline):
             if len(seen)%25==0:print('DISCLOSURE',kind,'pages',len(seen),'rows',rows,'oldest',str(min(dates)) if dates else 'none',flush=True)
             descending=descending and all(a>=b for a,b in zip(dates,dates[1:])) and (last is None or not dates or last>=max(dates))
             if dates:last=min(dates)
-            records.extend(trade_rows(html,kind,symbols,today,target))
+            records.extend(trade_rows(html,kind,symbols,today,BASE+url.urlparse(path).path))
             nxt=following_page(html,target)
             if nxt is None:reason='all available pages';break
             if dates and max(dates)<cutoff and descending:reason='all pages through the 45-day acquisition window';break
@@ -313,6 +313,31 @@ def scan_stock(symbol,isin,now):
     stock['_splits']=splits
     return stock
 
+def canonical_evidence(item):
+    item=dict(item);parsed=url.urlparse(item.get('source',''))
+    if parsed.hostname=='www.screener.in' and parsed.path.startswith('/trades/'):
+        item['source']=url.urlunparse(parsed._replace(query='',fragment=''))
+    return item
+
+def match_identity(symbol,matched,canonical=True):
+    stable=[symbol,[(z['tf'],z['date'],z.get('latestTouch'),sorted(hashlib.sha256(json.dumps(canonical_evidence(e) if canonical else e,sort_keys=True).encode()).hexdigest() for e in items)) for z,items in matched]]
+    return 'full-v2:'+hashlib.sha256(json.dumps(stable,sort_keys=True).encode()).hexdigest()
+
+def migrate_pagination_identities(state):
+    delivered=set(state['delivered']);mapping={}
+    for symbol,stock in state.get('records',{}).items():
+        matched=[(e['zone'],e['evidence']) for e in stock.get('evidence',[])]
+        if not matched:continue
+        old=match_identity(symbol,matched,False);new=match_identity(symbol,matched)
+        if old==new:continue
+        mapping[old]=new
+        if old in delivered and new not in delivered:state['delivered'].append(new);delivered.add(new)
+    seen=set(delivered);pending=[]
+    for item in state['pending']:
+        item=dict(item);item['id']=mapping.get(item['id'],item['id'])
+        if item['id'] not in seen:pending.append(item);seen.add(item['id'])
+    state['pending']=pending
+
 def alert_text(stock,matched):
     quote=stock['quality']['quote'];lines=['Institutional evidence + HTF demand',stock['symbol']+((' (quote symbol '+stock['quality']['data_symbol']+')') if stock['quality'].get('data_symbol',stock['symbol'])!=stock['symbol'] else '')+' | '+quote['kind']+' INR '+str(round(stock['cmp'],2)), 'Price as of '+quote['asof']+' | Exchange '+stock['quality'].get('exchange','NSE')]
     if stock['quality'].get('fallback'):lines.append(stock['quality']['fallback'])
@@ -349,6 +374,7 @@ def main():
     if store:store.read()
     state=store.state if store else {'version':1,'records':{},'pending':[],'delivered':[]}
     if destination and state.get('destination',{}).get('fingerprint')!=destination:raise ValueError('Private recipient must already be verified before full-universe scanning')
+    migrate_pagination_identities(state)
     sent_earlier=deliver_pending(store,destination) if store and state['pending'] else 0
     coverage={};source_errors=[];trade_evidence={}
     try:
@@ -372,7 +398,10 @@ def main():
         amcs=json.loads(read_bytes(AMC_API));coverage['MF provider']={'source':AMC_API,'code':amcs.get('code'),'fund_houses':len(amcs.get('data',[])),'schemes':sum(len(a.get('scheme',[])) for a in amcs.get('data',[])),'scope':'Every returned scheme page for each stock currently inside an HTF demand zone; all fund houses supplied by the provider. Provider omissions cannot be ruled out.'}
         if amcs.get('code')!=0:raise ValueError('AMC catalogue unavailable')
     except Exception as e:source_errors.append('MF catalogue: '+type(e).__name__)
-    known=state.setdefault('trades',{})
+    known={}
+    for value in state.get('trades',{}).values():
+        symbol=value['symbol'];item=canonical_evidence(value['item'])
+        known[hashlib.sha256(json.dumps([symbol,item],sort_keys=True).encode()).hexdigest()]={'symbol':symbol,'item':item}
     for symbol,items in trade_evidence.items():
         for e in items:known[hashlib.sha256(json.dumps([symbol,e],sort_keys=True).encode()).hexdigest()]={'symbol':symbol,'item':e}
     state['trades']={k:v for k,v in known.items() if 0<=(now.date()-day(v['item']['end'])).days<=45}
@@ -401,8 +430,7 @@ def main():
                     if matched:
                         matches.append(symbol)
                         # Route-specific history is preserved. Source identity changes, not price ticks, create a new alert.
-                        stable=[symbol,[(z['tf'],z['date'],z.get('latestTouch'),sorted(hashlib.sha256(json.dumps(e,sort_keys=True).encode()).hexdigest() for e in items)) for z,items in matched]]
-                        identity='full-v2:'+hashlib.sha256(json.dumps(stable,sort_keys=True).encode()).hexdigest()
+                        identity=match_identity(symbol,matched)
                         if identity not in queued and identity not in delivered:state['pending'].append({'id':identity,'text':alert_text(stock,matched)});queued.add(identity)
                     state['records'][symbol]=stock
                 print('CHECKED',symbol,'inside',len(stock.get('zones',[])),'match',bool(stock.get('evidence')),flush=True)

@@ -1,0 +1,31 @@
+name: Check disclosure date format
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  check-dates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install beautifulsoup4==4.14.3
+      - name: Inspect public disclosure date cells
+        env:
+          SCREENER_EMAIL: ${{ secrets.SCREENER_EMAIL }}
+          SCREENER_PASSWORD: ${{ secrets.SCREENER_PASSWORD }}
+        run: |
+          python - <<'PY'
+          from institutional_confluence import login, BASE, TRADE_PATHS
+          from scanner_runtime import disclosure_page
+          from bs4 import BeautifulSoup
+          client=login()
+          for kind in ('Insider','SAST'):
+              soup=BeautifulSoup(disclosure_page(client,BASE+TRADE_PATHS[kind]),'html.parser')
+              table=soup.select_one('table#result_list') or soup.select_one('main table')
+              print('SOURCE',kind)
+              print('HEADERS',[e.get_text(' ',strip=True) for e in table.select('thead th')])
+              for row in table.select('tbody tr')[:2]:
+                  for cell in row.select('td'):
+                      if 'date' in ' '.join(cell.get('class',[])):
+                          print('PUBLIC DATE CELL',str(cell))
+          PY

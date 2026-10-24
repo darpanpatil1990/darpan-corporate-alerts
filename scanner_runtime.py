@@ -208,6 +208,27 @@ def following_page(html,current):
         if p.scheme=='https' and p.hostname==parsed.hostname and p.path==parsed.path and target!=current:return target
     return None
 
+def disclosure_day(cell):
+    # Prefer the source's machine-readable absolute date over labels such as "yesterday".
+    candidates=[cell.get_text(' ',strip=True)]
+    attributes=('datetime','title','data-date','data-iso-date','data-sort','data-sort-value','data-order')
+    for element in [cell]+list(cell.find_all(True)):
+        candidates.extend(str(element[k]) for k in attributes if element.get(k))
+    dates=set()
+    for raw in candidates:
+        cleaned=re.sub(r'\b([A-Za-z]{3,4})\.',r'\1',raw).replace('Sept ','Sep ').replace(',',' ')
+        try:dates.add(day(cleaned));continue
+        except ValueError:pass
+        try:
+            stamp=datetime.fromisoformat(raw.replace('Z','+00:00'))
+            dates.add((stamp.astimezone(IST) if stamp.tzinfo else stamp).date())
+        except ValueError:pass
+    if len(dates)==1:return dates.pop()
+    if dates:raise ValueError('Conflicting absolute disclosure dates')
+    metadata=[{k:str(e[k])[:80] for k in attributes if e.get(k)} for e in [cell]+list(cell.find_all(True))]
+    print('DISCLOSURE DATE ATTRIBUTES',metadata,flush=True)
+    raise ValueError('Unrecognised disclosure date: '+candidates[0][:50])
+
 def disclosure_dates(html,normalize=False):
     soup=BeautifulSoup(html,'html.parser');table=soup.select_one('table#result_list') or soup.select_one('main table')
     if table is None:raise ValueError('Disclosure table unavailable')
@@ -220,9 +241,7 @@ def disclosure_dates(html,normalize=False):
         cells=row.find_all(['td','th'],recursive=False)
         if len(cells)==len(heads):
             raw=cells[index].get_text(' ',strip=True)
-            cleaned=re.sub(r'\b([A-Za-z]{3,4})\.',r'\1',raw).replace('Sept ','Sep ').replace(',',' ')
-            try:parsed=day(cleaned)
-            except ValueError:raise ValueError('Unrecognised disclosure date: '+raw[:50])
+            parsed=disclosure_day(cells[index])
             dates.append(parsed)
             if normalize:cells[index].clear();cells[index].append(parsed.isoformat())
     return (str(soup),dates) if normalize else dates
@@ -279,7 +298,7 @@ class CompactStore(Store):
             super().save()
         finally:self.state=original
 
-def scan_stock(symbol,isin,now):
+def scan_stock(symbol,isin,now=None):
     if symbol.startswith('DUMMY') and isin.startswith('DUM'):return {'symbol':symbol,'excluded':'Official index placeholder without a tradable stock ISIN/price history'}
     cap=market_cap(symbol)
     if Decimal(cap['cap'])<=500:return {'symbol':symbol,'excluded':'Market cap <= INR 500 crore'}
@@ -288,17 +307,17 @@ def scan_stock(symbol,isin,now):
     verified_alias=YAHOO_QUOTE_ALIASES.get(symbol)
     if verified_alias and verified_alias[0]==isin:data_symbol=verified_alias[1]
     try:
-        obj,source=prices(data_symbol);payload,splits,quality=price_payload(obj,data_symbol,now)
+        obj,source=prices(data_symbol);payload,splits,quality=price_payload(obj,data_symbol,now or datetime.now(IST))
     except (urllib.error.HTTPError,ValueError) as error:
         if isinstance(error,urllib.error.HTTPError) and error.code!=404:raise
         alternative=cap.get('provider_symbol',symbol)
         if verified_alias and verified_alias[0]==isin:
             # The same listed REIT has a separate BSE history. Never mix exchange candles.
             data_symbol=symbol;exchange='BSE'
-            obj,source=prices(data_symbol,exchange);payload,splits,quality=price_payload(obj,data_symbol,now,exchange)
+            obj,source=prices(data_symbol,exchange);payload,splits,quality=price_payload(obj,data_symbol,now or datetime.now(IST),exchange)
         elif alternative!=data_symbol:
             data_symbol=alternative
-            obj,source=prices(data_symbol);payload,splits,quality=price_payload(obj,data_symbol,now)
+            obj,source=prices(data_symbol);payload,splits,quality=price_payload(obj,data_symbol,now or datetime.now(IST))
         else:raise
     payload['symbol']=symbol;quality['data_symbol']=data_symbol;quality['stock_isin']=isin;quality['exchange']=exchange
     if exchange=='BSE':quality['fallback']='NSE daily history insufficient/unavailable; all demand bands and price use the separate BSE daily series.'
@@ -306,7 +325,7 @@ def scan_stock(symbol,isin,now):
     stock=json.loads(run.stdout)[0];stock.update({'price_source':source,'market_cap_cr':cap['cap'],'quality':quality,'evidence':[]})
     if stock['zones']:
         try:
-            mf=mf_for_stock(isin,now.date());stock['mf_status']={k:v for k,v in mf.items() if k!='evidence'};stock['_mf']=mf['evidence']
+            mf=mf_for_stock(isin,(now or datetime.now(IST)).date());stock['mf_status']={k:v for k,v in mf.items() if k!='evidence'};stock['_mf']=mf['evidence']
         except Exception as e:
             stock['mf_status']={'complete':False,'error':type(e).__name__+': '+str(e)[:160]};stock['_mf']=[]
     else:stock['mf_status']={'scope':'Not needed: price outside HTF demand zones'};stock['_mf']=[]
@@ -383,7 +402,7 @@ def main():
     except Exception as e:coverage['Market cap']={'source':CAP_API,'fallback':'Independent Screener identity checks','error':type(e).__name__+': '+str(e)[:120]}
     aliases={v['provider_symbol']:k for k,v in CAP_LOOKUP.items() if v['provider_symbol']!=k}
     trade_symbols=list(dict.fromkeys(symbols+list(aliases)))
-    deadline=time.monotonic()+18*60
+    deadline=time.monotonic()+30*60
     if not dry:
         with ThreadPoolExecutor(max_workers=4) as executor:
             tasks={executor.submit(read_disclosures,kind,path,trade_symbols,now.date(),deadline):kind for kind,path in TRADE_PATHS.items()}
@@ -413,7 +432,7 @@ def main():
     if store:store.save()
     workers=min(8,max(1,int(os.environ.get('SCANNER_WORKERS','6'))))
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        tasks={executor.submit(scan_stock,s,isin[s],now):s for s in symbols}
+        tasks={executor.submit(scan_stock,s,isin[s]):s for s in symbols}
         for task in as_completed(tasks):
             symbol=tasks[task]
             try:

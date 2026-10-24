@@ -9,8 +9,13 @@ from decimal import Decimal
 from pathlib import Path
 from bs4 import BeautifulSoup
 from exchange_history import bootstrap as bootstrap_nse,augment as augment_nse
+from exchange_disclosures import load as load_nse_disclosures
 from institutional_confluence import (Store, request, UNIVERSE_URL, universe_from_csv, IST,
     day, month_end, login, trade_rows, overlaps, verify_private_destination, BASE, TRADE_PATHS)
+
+# The NSE product page links this official archive CSV directly; avoid the failing Nifty Indices redirect.
+LEGACY_UNIVERSE_URL=UNIVERSE_URL
+UNIVERSE_URL='https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv'
 
 MF_API='https://ow-static-scanx.dhan.co/staticscanx/mfpastholdingsbyisin'
 CAP_API='https://ow-scanx-analytics.dhan.co/customscan/fetchdt'
@@ -51,8 +56,8 @@ def load_universe(now,state):
             if isin:members[symbol]=isin
             elif symbol.startswith('DUMMY') and 'placeholder' in batch.get('excluded',{}).get(symbol,''):omitted.append(symbol)
             else:raise ValueError('Prior universe identity missing; refusing partial fallback')
-        snapshot={'source':UNIVERSE_URL,'verified_at':batch['date'],'members':members,'original_member_count':len(checked),'omitted_placeholders':omitted,'provenance':'Migrated from the preceding complete official-universe scan and exact stock ISINs'}
-    if snapshot.get('source')!=UNIVERSE_URL:raise ValueError('Cached universe source mismatch')
+        snapshot={'source':LEGACY_UNIVERSE_URL,'verified_at':batch['date'],'members':members,'original_member_count':len(checked),'omitted_placeholders':omitted,'provenance':'Migrated from the preceding complete official-universe scan and exact stock ISINs'}
+    if snapshot.get('source') not in (UNIVERSE_URL,LEGACY_UNIVERSE_URL):raise ValueError('Cached universe source mismatch')
     verified=datetime.fromisoformat(snapshot['verified_at'])
     if verified.tzinfo is None or not 0<=now.timestamp()-verified.timestamp()<=7*86400:raise ValueError('Official universe unavailable; last verified membership exceeds 7 days')
     members=snapshot['members'];validate_members(members)
@@ -392,10 +397,29 @@ def canonical_evidence(item):
 
 def acquisition_overlaps(zone,evidence,asof,splits):
     if evidence.get('date_basis','').startswith('reporting date'):return False
+    if evidence.get('date_basis')=='NSE transaction period':
+        touch=zone.get('latestTouch') or zone.get('firstTouch')
+        if not touch or evidence['start']<touch[:10]:return False
     return overlaps(zone,evidence,asof,splits)
 
+def evidence_identity(item):
+    stable=canonical_evidence(item)
+    if stable.get('date_basis')=='NSE transaction period':
+        # A revised publication or second attachment is not another purchase.
+        stable={k:stable.get(k) for k in ('kind','stock_isin','buyer','start','end','qty','mode','execution_venue','date_basis')}
+    return hashlib.sha256(json.dumps(stable,sort_keys=True).encode()).hexdigest()
+
+def trade_identity(symbol,item):return hashlib.sha256(json.dumps([symbol,evidence_identity(item)]).encode()).hexdigest()
+
+def delivered_superset(symbol,previous,matched,delivered):
+    old=[(e['zone'],e['evidence']) for e in previous.get('evidence',[])]
+    if not old or match_identity(symbol,old) not in delivered:return False
+    key=lambda z:(z['tf'],z['date'],z.get('latestTouch'))
+    contexts={key(z):{evidence_identity(e) for e in items} for z,items in old}
+    return all(key(z) in contexts and {evidence_identity(e) for e in items}<=contexts[key(z)] for z,items in matched)
+
 def match_identity(symbol,matched,canonical=True):
-    stable=[symbol,[(z['tf'],z['date'],z.get('latestTouch'),sorted(hashlib.sha256(json.dumps(canonical_evidence(e) if canonical else e,sort_keys=True).encode()).hexdigest() for e in items)) for z,items in matched]]
+    stable=[symbol,[(z['tf'],z['date'],z.get('latestTouch'),sorted(evidence_identity(e) if canonical else hashlib.sha256(json.dumps(e,sort_keys=True).encode()).hexdigest() for e in items)) for z,items in matched]]
     return 'full-v2:'+hashlib.sha256(json.dumps(stable,sort_keys=True).encode()).hexdigest()
 
 def migrate_pagination_identities(state):
@@ -436,14 +460,15 @@ def alert_text(stock,matched):
     buyers={}
     for z,items in matched:
         lines.append(f"{z['tf']} demand {z['d']:.2f}–{z['p']:.2f} | formed {z['date']} | {'First return' if z['firstReturn'] else 'Tested context; entry confirmation required'} | visit {z.get('latestTouch')}")
-        for item in items:buyers[hashlib.sha256(json.dumps(item,sort_keys=True).encode()).hexdigest()]=item
+        for item in items:buyers[evidence_identity(item)]=item
     for e in list(buyers.values())[:4]:
         measure='quantity '+str(e.get('qty','not provided'))
         if 'change' in e:measure+=' | increase '+str(e['change'])
         if 'reported_measure' in e:measure+=' | '+e['reported_measure']
         lines.extend([e['kind']+' | '+e['buyer'],e['start']+' → '+e['end']+' | '+measure,e['source']])
+        if e.get('date_basis')=='NSE transaction period':lines.extend([e['mode']+' | Category as disclosed: '+e.get('buyer_category','Not supplied'),'Published '+e['reported_at']])
     if len(buyers)>4:lines.append(str(len(buyers)-4)+' additional qualifying scheme/acquisition records retained in scan state.')
-    lines.extend(['Month-end quantity change is not a verified purchase today. Known splits suppress monthly MF matches; other non-trade changes remain possible.','Demand Lab v31 OHLC-derived bands; no analyst overrides inferred. Public quotes may be delayed.','Price: Yahoo Finance / NSE final bhavcopy, as labelled above. MF: ScanX dated monthly quantities. Disclosed acquisitions: Screener.'])
+    lines.extend(['Month-end quantity change is not a verified purchase today. Known splits suppress monthly MF matches; other non-trade changes remain possible.','Demand Lab v31 OHLC-derived bands; no analyst overrides inferred. Public quotes may be delayed.','Price: Yahoo Finance / NSE final bhavcopy, as labelled above. MF: ScanX monthly quantities. Bulk/Block: Screener. Insider/SAST: NSE transaction dates.'])
     return '\n'.join(lines)[:3950]
 
 def deliver_pending(store,destination,limit=100):
@@ -486,13 +511,15 @@ def main():
     deadline=time.monotonic()+30*60
     if not dry:
         with ThreadPoolExecutor(max_workers=4) as executor:
-            tasks={executor.submit(read_disclosures,kind,path,trade_symbols,now.date(),deadline):kind for kind,path in TRADE_PATHS.items()}
+            tasks={executor.submit(read_disclosures,kind,path,trade_symbols,now.date(),deadline):kind for kind,path in TRADE_PATHS.items() if kind in ('Bulk','Block')}
+            for kind in ('Insider','SAST'):tasks[executor.submit(load_nse_disclosures,kind,isin,now.date(),read_bytes,cached_json,aliases)]=kind
             for task in as_completed(tasks):
                 kind=tasks[task]
                 try:
                     records,status=task.result();coverage[kind]=status
-                    if kind in ('Insider','SAST'):status.update({'date_basis':'Source reporting dates; actual transaction dates not supplied','timed_acquisition_matches_eligible':False})
-                    if not status['complete']:source_errors.append(kind+': '+status['scope'])
+                    if kind in ('Insider','SAST'):status['timed_acquisition_matches_eligible']=True
+                    if not status['complete']:source_errors.append(kind+': '+str(status.get('scope') or status.get('errors'))[:200])
+                    print('ACQUISITION SOURCE',kind,json.dumps(status),flush=True)
                     for symbol,item in records:trade_evidence.setdefault(aliases.get(symbol,symbol),[]).append(item)
                 except Exception as e:source_errors.append(kind+': '+type(e).__name__+' '+str(e)[:160]);coverage[kind]={'complete':False,'error':str(e)[:160]}
     try:
@@ -502,9 +529,11 @@ def main():
     known={}
     for value in state.get('trades',{}).values():
         symbol=value['symbol'];item=canonical_evidence(value['item'])
-        known[hashlib.sha256(json.dumps([symbol,item],sort_keys=True).encode()).hexdigest()]={'symbol':symbol,'item':item}
+        # NSE is a full publication-window snapshot: superseded or corrected facts must not survive from an older run.
+        if item.get('date_basis')=='NSE transaction period':continue
+        known[trade_identity(symbol,item)]={'symbol':symbol,'item':item}
     for symbol,items in trade_evidence.items():
-        for e in items:known[hashlib.sha256(json.dumps([symbol,e],sort_keys=True).encode()).hexdigest()]={'symbol':symbol,'item':e}
+        for e in items:known[trade_identity(symbol,e)]={'symbol':symbol,'item':e}
     state['trades']={k:v for k,v in known.items() if 0<=(now.date()-day(v['item']['end'])).days<=45}
     for value in state['trades'].values():
         items=trade_evidence.setdefault(value['symbol'],[])
@@ -518,7 +547,7 @@ def main():
         for task in as_completed(tasks):
             symbol=tasks[task]
             try:
-                stock=task.result();checked.append(symbol)
+                stock=task.result();checked.append(symbol);previous=state['records'].get(symbol,{})
                 stock['universe_membership']={k:universe_status[k] for k in ('verified_at','current_source_verified')}
                 if stock.get('excluded'):excluded.append(symbol);exclusion_reasons[symbol]=stock['excluded'];state['records'].pop(symbol,None)
                 else:
@@ -534,6 +563,7 @@ def main():
                         matches.append(symbol)
                         # Route-specific history is preserved. Source identity changes, not price ticks, create a new alert.
                         identity=match_identity(symbol,matched)
+                        if identity not in delivered and delivered_superset(symbol,previous,matched,delivered):state['delivered'].append(identity);delivered.add(identity)
                         if identity not in queued and identity not in delivered:state['pending'].append({'id':identity,'text':alert_text(stock,matched)});queued.add(identity)
                     state['records'][symbol]=stock
                 print('CHECKED',symbol,'inside',len(stock.get('zones',[])),'match',bool(stock.get('evidence')),flush=True)

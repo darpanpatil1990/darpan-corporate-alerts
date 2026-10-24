@@ -212,7 +212,7 @@ def following_page(html,current):
 
 def disclosure_day(cell):
     # Prefer the source's machine-readable absolute date over labels such as "yesterday".
-    candidates=[cell.get_text(' ',strip=True)]
+    candidates=[cell.get_text(' ',strip=True)]+[e.get_text(' ',strip=True) for e in cell.find_all(True)]
     attributes=('datetime','title','data-date','data-iso-date','data-sort','data-sort-value','data-order')
     for element in [cell]+list(cell.find_all(True)):
         candidates.extend(str(element[k]) for k in attributes if element.get(k))
@@ -228,14 +228,14 @@ def disclosure_day(cell):
     if len(dates)==1:return dates.pop()
     if dates:raise ValueError('Conflicting absolute disclosure dates')
     metadata=[{k:str(v)[:160] for k,v in e.attrs.items()} for e in [cell]+list(cell.find_all(True))]
-    print('DISCLOSURE DATE ATTRIBUTES',metadata,flush=True)
+    print('DISCLOSURE DATE CELL',str(cell),flush=True)
     raise ValueError('Unrecognised disclosure date: '+candidates[0][:50])
 
-def disclosure_dates(html,normalize=False):
+def disclosure_dates(html,normalize=False,issues=None):
     soup=BeautifulSoup(html,'html.parser');table=soup.select_one('table#result_list') or soup.select_one('main table')
     if table is None:raise ValueError('Disclosure table unavailable')
     if normalize:
-        exports=[a.get('href') for a in soup.select('a[href]') if 'export' in a.get_text(' ',strip=True).lower() or 'csv' in a.get_text(' ',strip=True).lower()]
+        exports=[a.get('href') for a in soup.select('a[href]') if re.fullmatch(r'(?:export|download)(?:\s+(?:csv|data))?|csv',a.get_text(' ',strip=True),re.I)]
         if exports:print('DISCLOSURE PUBLIC EXPORT LINKS',exports,flush=True)
     heads=[h.get_text(' ',strip=True).lower() for h in table.select('thead th')]
     names={'date','trade date','transaction date','acquisition date','disclosure date'}
@@ -246,7 +246,10 @@ def disclosure_dates(html,normalize=False):
         cells=row.find_all(['td','th'],recursive=False)
         if len(cells)==len(heads):
             raw=cells[index].get_text(' ',strip=True)
-            parsed=disclosure_day(cells[index])
+            try:parsed=disclosure_day(cells[index])
+            except ValueError as error:
+                if issues is None:raise
+                issues.append(str(error));row.decompose();continue
             dates.append(parsed)
             if normalize:cells[index].clear();cells[index].append(parsed.isoformat())
     return (str(soup),dates) if normalize else dates
@@ -266,7 +269,7 @@ def disclosure_page(client,target):
 
 def read_disclosures(kind,path,symbols,today,deadline):
     client=login();target=BASE+path;seen=set();records=[];rows=0;last=None;descending=True
-    cutoff=today-timedelta(days=45);reason=''
+    cutoff=today-timedelta(days=45);reason='';undated=[]
     complete=True
     try:
         while target:
@@ -274,7 +277,7 @@ def read_disclosures(kind,path,symbols,today,deadline):
             if target in seen:raise ValueError('Disclosure pagination loop')
             if len(seen)>=500:raise ValueError('Disclosure pagination limit; coverage incomplete')
             html=disclosure_page(client,target)
-            seen.add(target);html,dates=disclosure_dates(html,normalize=True);rows+=len(dates)
+            seen.add(target);before=len(undated);html,dates=disclosure_dates(html,normalize=True,issues=undated);rows+=len(dates)+len(undated)-before
             if len(seen)%25==0:print('DISCLOSURE',kind,'pages',len(seen),'rows',rows,'oldest',str(min(dates)) if dates else 'none',flush=True)
             descending=descending and all(a>=b for a,b in zip(dates,dates[1:])) and (last is None or not dates or last>=max(dates))
             if dates:last=min(dates)
@@ -285,8 +288,10 @@ def read_disclosures(kind,path,symbols,today,deadline):
             target=nxt;time.sleep(.15)
     except Exception as e:
         complete=False;reason=type(e).__name__+': '+str(e)[:160]
+    if undated:
+        complete=False;reason+='; '+str(len(undated))+' rows await an absolute source date: '+undated[0][:100]
     unique={hashlib.sha256(json.dumps([s,e],sort_keys=True).encode()).hexdigest():(s,e) for s,e in records}
-    return list(unique.values()),{'pages':len(seen),'rows':rows,'complete':complete,'scope':reason,'start':cutoff.isoformat(),'end':today.isoformat()}
+    return list(unique.values()),{'pages':len(seen),'rows':rows,'complete':complete,'scope':reason,'start':cutoff.isoformat(),'end':today.isoformat(),'unresolved_date_rows':len(undated)}
 
 class CompactStore(Store):
     def read(self):

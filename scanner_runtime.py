@@ -454,6 +454,56 @@ def migrate_pagination_identities(state):
     if held:state['held_for_evidence_review']=held
     state['pending']=pending
 
+TIMEFRAME_CODES={'Monthly':'MIT','Quarterly':'QIT','Half Yearly':'HIT','Yearly':'YIT'}
+
+def timeframe_groups(matched):
+    groups={}
+    for zone,items in matched:groups.setdefault(zone['tf'],[]).append((zone,items))
+    return {tf:sorted(groups[tf],key=lambda pair:(pair[0]['date'],pair[0].get('latestTouch') or '')) for tf in TIMEFRAME_CODES if tf in groups}
+
+def timeframe_alert(stock,tf,group,all_matches):
+    others=[TIMEFRAME_CODES[k] for k in timeframe_groups(all_matches) if k!=tf]
+    text=alert_text(stock,group)
+    if others:text+='\nAlso matching: '+', '.join(others)+' (separate alerts).'
+    return {'id':match_identity(stock['symbol'],group),'kind':'timeframe_match','timeframe':tf,
+            'text':TIMEFRAME_CODES[tf]+' | '+tf+' Demand\n'+text,'watches':alert_watches(stock,group)}
+
+def migrate_timeframe_alerts(state):
+    """Preserve delivered combined history; split only reconstructable unsent alerts."""
+    delivered=set(state['delivered']);replacements={}
+    for symbol,stock in state.get('records',{}).items():
+        matched=[(e['zone'],e['evidence']) for e in stock.get('evidence',[])]
+        if not matched:continue
+        legacy=match_identity(symbol,matched);groups=timeframe_groups(matched)
+        replacements[legacy]=[timeframe_alert(stock,tf,group,matched) for tf,group in groups.items()]
+        if legacy in delivered:
+            for group in groups.values():
+                identity=match_identity(symbol,group)
+                if identity not in delivered:state['delivered'].append(identity);delivered.add(identity)
+    pending=[];seen=set(delivered)
+    for item in state['pending']:
+        if item.get('kind') in ('timeframe_match','zone_break'):parts=[item]
+        elif item['id'] in replacements:parts=replacements[item['id']]
+        elif item['id'] in delivered:continue
+        else:
+            # Never send an old combined message whose original evidence cannot be recovered.
+            held=state.setdefault('held_for_timeframe_review',[])
+            if not any(old['id']==item['id'] for old in held):held.append(item)
+            continue
+        for part in parts:
+            if part['id'] not in seen:pending.append(part);seen.add(part['id'])
+    state['pending']=pending
+
+def queue_timeframe_alerts(state,stock,matched,previous,queued,delivered):
+    old_groups=timeframe_groups([(e['zone'],e['evidence']) for e in previous.get('evidence',[])])
+    for tf,group in timeframe_groups(matched).items():
+        identity=match_identity(stock['symbol'],group)
+        old={'evidence':[{'zone':z,'evidence':items} for z,items in old_groups.get(tf,[])]}
+        if identity not in delivered and delivered_superset(stock['symbol'],old,group,delivered):
+            state['delivered'].append(identity);delivered.add(identity)
+        if identity not in queued and identity not in delivered:
+            state['pending'].append(timeframe_alert(stock,tf,group,matched));queued.add(identity)
+
 def watch_identity(symbol,isin,exchange,z):
     return 'zone-watch:'+hashlib.sha256(json.dumps([symbol,isin,exchange,z['tf'],z['date'],z['d'],z['p']],sort_keys=True).encode()).hexdigest()
 
@@ -481,7 +531,7 @@ def queue_zone_breaks(state,stock):
         if any(event[k]!=watch[k] for k in ('tf','date','d','p')) or event['breach_date']<=watch['registered_asof'] or not math.isfinite(event['close']) or event['close']>=watch['d']:continue
         identity='zone-break:'+watch['id']
         if identity in known:continue
-        text='\n'.join(['Demand zone invalidated | '+stock['symbol'],f"{watch['tf']} demand {watch['d']:.2f}–{watch['p']:.2f} | formed {watch['date']}",f"Completed {watch['tf']} candle close INR {event['close']:.2f} below distal INR {watch['d']:.2f}",'Candle last trading date '+event['breach_date']+' | Exchange '+watch['exchange'],'Update to an earlier delivered research alert. This demand setup is invalidated; other timeframe zones are assessed separately.','Price source: '+stock['price_source']])
+        text='\n'.join([TIMEFRAME_CODES.get(watch['tf'],watch['tf'])+' | Demand zone invalidated | '+stock['symbol'],f"{watch['tf']} demand {watch['d']:.2f}–{watch['p']:.2f} | formed {watch['date']}",f"Completed {watch['tf']} candle close INR {event['close']:.2f} below distal INR {watch['d']:.2f}",'Candle last trading date '+event['breach_date']+' | Exchange '+watch['exchange'],'Update to an earlier delivered research alert. This demand setup is invalidated; other timeframe zones are assessed separately.','Price source: '+stock['price_source']])
         state['pending'].append({'id':identity,'kind':'zone_break','text':text});known.add(identity)
         watch['breach']=event
 
@@ -547,6 +597,7 @@ def main():
     if destination and state.get('destination',{}).get('fingerprint')!=destination:raise ValueError('Private recipient must already be verified before full-universe scanning')
     migrate_pagination_identities(state)
     migrate_delivered_watches(state)
+    migrate_timeframe_alerts(state)
     sent_earlier=deliver_pending(store,destination) if store and state['pending'] else 0
     symbols,isin,universe_status=load_universe(now,state)
     # A sample is an explicit development mode; production always attempts the whole verified membership.
@@ -620,10 +671,7 @@ def main():
                         if items:matched.append((z,items));stock['evidence'].append({'zone':z,'evidence':items})
                     if matched:
                         matches.append(symbol)
-                        # Route-specific history is preserved. Source identity changes, not price ticks, create a new alert.
-                        identity=match_identity(symbol,matched)
-                        if identity not in delivered and delivered_superset(symbol,previous,matched,delivered):state['delivered'].append(identity);delivered.add(identity)
-                        if identity not in queued and identity not in delivered:state['pending'].append({'id':identity,'text':alert_text(stock,matched),'watches':alert_watches(stock,matched)});queued.add(identity)
+                        queue_timeframe_alerts(state,stock,matched,previous,queued,delivered)
                     state['records'][symbol]=stock
                 print('CHECKED',symbol,'inside',len(stock.get('zones',[])),'match',bool(stock.get('evidence')),flush=True)
             except Exception as e:

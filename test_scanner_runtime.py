@@ -1,6 +1,6 @@
 import copy,json,unittest
 from datetime import datetime,timedelta
-from unittest.mock import patch
+from unittest.mock import patch,Mock
 import scanner_runtime as s
 
 class RuntimeTests(unittest.TestCase):
@@ -45,6 +45,41 @@ class RuntimeTests(unittest.TestCase):
  def test_pagination_only_observed_same_path(self):
   self.assertEqual(s.following_page('<a rel="next" href="?p=2">Next</a>','https://www.screener.in/trades/bulk/'),'https://www.screener.in/trades/bulk/?p=2')
   self.assertIsNone(s.following_page('<a rel="next" href="https://elsewhere.test/">Next</a>','https://www.screener.in/trades/bulk/'))
+ def test_wrong_destination_stops_delivery(self):
+  store=Mock();store.state={'pending':[{'id':'queued','text':'dated research match'}],'delivered':[]}
+  with patch.object(s,'verify_private_destination',return_value='different'),patch.object(s,'request') as send:
+   with self.assertRaises(ValueError):s.deliver_pending(store,'verified-private')
+  send.assert_not_called();self.assertEqual(len(store.state['pending']),1)
+ def test_rejected_delivery_keeps_queue(self):
+  store=Mock();store.state={'pending':[{'id':'queued','text':'dated research match'}],'delivered':[]}
+  with patch.object(s,'verify_private_destination',return_value='verified-private'),patch.object(s,'request',return_value='{"ok":false}'),patch.dict(s.os.environ,{'BOT_TOKEN':'unit-test-token','CHAT_ID':'unit-test-private'}):
+   with self.assertRaises(ValueError):s.deliver_pending(store,'verified-private')
+  self.assertEqual(store.state['delivered'],[]);self.assertEqual(len(store.state['pending']),1)
+ def test_renamed_symbol_requires_same_isin(self):
+  d={'code':0,'data':[{'Sym':'NEW','Isin':'INE000000001','Exch':'NSE','Mcap':700}]}
+  with patch.object(s,'cached_json',return_value=d):values,status=s.load_scanx_caps({'OLD':'INE000000001'})
+  self.assertEqual(values['OLD']['provider_symbol'],'NEW');self.assertEqual(status['symbol_aliases'],{'OLD':'NEW'})
+ def test_official_dummy_placeholder_has_no_invented_price(self):
+  with patch.object(s,'market_cap') as cap:
+   value=s.scan_stock('DUMMYHEG','DUM545A01024',datetime(2026,10,24,tzinfo=s.IST))
+  self.assertIn('placeholder',value['excluded']);cap.assert_not_called()
+ def test_abbreviated_source_date_is_normalized_for_trade_parser(self):
+  html='<main><table><thead><tr><th>Date</th></tr></thead><tbody><tr><td>Oct. 23, 2026</td></tr></tbody></table></main>'
+  normalized,dates=s.disclosure_dates(html,normalize=True)
+  self.assertEqual(dates,[s.day('2026-10-23')]);self.assertIn('2026-10-23',normalized)
+ def test_ambiguous_relative_source_date_is_not_invented(self):
+  html='<main><table><thead><tr><th>Date</th></tr></thead><tbody><tr><td>Yesterday</td></tr></tbody></table></main>'
+  with self.assertRaises(ValueError):s.disclosure_dates(html)
+ def test_later_page_failure_preserves_dated_acquisitions(self):
+  html='<main><table><thead><tr><th>Company</th><th>Person</th><th>Date</th><th>Type</th><th>Value</th></tr></thead><tbody><tr><td><a href="/company/TEST/">TEST</a></td><td>Named acquirer</td><td>23 Oct 2026</td><td>Buy</td><td>10</td></tr></tbody></table><a rel="next" href="?p=2">Next</a></main>'
+  with patch.object(s,'login',return_value=Mock()),patch.object(s,'disclosure_page',side_effect=[html,ValueError('Source unavailable')]),patch.object(s.time,'sleep'):
+   records,status=s.read_disclosures('Bulk','/trades/bulk/', ['TEST'],s.day('2026-10-24'),s.time.monotonic()+60)
+  self.assertEqual(len(records),1);self.assertFalse(status['complete']);self.assertIn('Source unavailable',status['scope'])
+ def test_market_cap_requires_exact_stock_identity(self):
+  d={'code':0,'data':[{'Sym':'TEST','Isin':'WRONG','Exch':'NSE','Mcap':99999},{'Sym':'RIGHT','Isin':'INE000000002','Exch':'NSE','Mcap':700}]}
+  with patch.object(s,'cached_json',return_value=d):
+   values,status=s.load_scanx_caps({'TEST':'INE000000001','RIGHT':'INE000000002'})
+  self.assertEqual(set(values),{'RIGHT'});self.assertEqual(status['fallback_symbols'],['TEST'])
  def test_all_provider_pages_required(self):
   d=self.mf();d.update(totalcount=2,totalpages=1)
   with patch.object(s,'cached_json',side_effect=lambda f,k,t,loader:loader()),patch.object(s,'read_bytes',return_value=json.dumps(d).encode()):

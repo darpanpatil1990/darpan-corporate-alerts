@@ -70,6 +70,19 @@ class RuntimeTests(unittest.TestCase):
  def test_ambiguous_relative_source_date_is_not_invented(self):
   html='<main><table><thead><tr><th>Date</th></tr></thead><tbody><tr><td>Yesterday</td></tr></tbody></table></main>'
   with self.assertRaises(ValueError):s.disclosure_dates(html)
+ def test_absolute_nested_date_is_not_lost_in_display_label(self):
+  cell=s.BeautifulSoup('<td>Yesterday <span>2026-10-23</span></td>','html.parser').td
+  self.assertEqual(s.disclosure_day(cell),s.day('2026-10-23'))
+ def test_relative_date_does_not_discard_other_dated_disclosures(self):
+  html='<main><table><thead><tr><th>Company</th><th>Person</th><th>Date</th><th>Type</th><th>Value</th></tr></thead><tbody><tr><td><a href="/company/TEST/">TEST</a></td><td>Unresolved</td><td>Yesterday</td><td>Buy</td><td>10</td></tr><tr><td><a href="/company/TEST/">TEST</a></td><td>Verified</td><td>22 Oct 2026</td><td>Buy</td><td>20</td></tr></tbody></table></main>'
+  with patch.object(s,'login',return_value=Mock()),patch.object(s,'disclosure_page',return_value=html):
+   records,status=s.read_disclosures('Insider','/trades/insiders/', ['TEST'],s.day('2026-10-24'),s.time.monotonic()+60)
+  self.assertEqual(len(records),1);self.assertEqual(records[0][1]['buyer'],'Verified')
+  self.assertFalse(status['complete']);self.assertEqual(status['unresolved_date_rows'],1)
+ def test_reporting_date_is_not_claimed_as_transaction_date(self):
+  item=s.canonical_evidence({'kind':'Insider disclosed acquisition','buyer':'Reported buyer','start':'2026-10-23','end':'2026-10-23','source':'https://www.screener.in/trades/insiders/?p=2'})
+  self.assertIn('reporting date',item['date_basis'])
+  self.assertFalse(s.acquisition_overlaps({'latestTouch':'2026-10-22'},item,'2026-10-23',[]))
  def test_later_page_failure_preserves_dated_acquisitions(self):
   html='<main><table><thead><tr><th>Company</th><th>Person</th><th>Date</th><th>Type</th><th>Value</th></tr></thead><tbody><tr><td><a href="/company/TEST/">TEST</a></td><td>Named acquirer</td><td>23 Oct 2026</td><td>Buy</td><td>10</td></tr></tbody></table><a rel="next" href="?p=2">Next</a></main>'
   with patch.object(s,'login',return_value=Mock()),patch.object(s,'disclosure_page',side_effect=[html,ValueError('Source unavailable')]),patch.object(s.time,'sleep'):

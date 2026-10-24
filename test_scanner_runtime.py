@@ -103,6 +103,22 @@ class RuntimeTests(unittest.TestCase):
   now=datetime(2026,10,23,17,tzinfo=s.IST);d=self.chart(now);d['chart']['result'][0]['indicators']['quote'][0]['close'][-1]=None
   _,_,quality=s.price_payload(d,'TEST',now)
   self.assertEqual(quality['completed_asof'],'2026-10-22');self.assertFalse(quality['current_alerts_eligible'])
+ def test_relative_label_uses_absolute_source_attribute(self):
+  cell=s.BeautifulSoup('<td><time datetime="2026-10-23">yesterday</time></td>','html.parser').td
+  self.assertEqual(s.disclosure_day(cell),s.day('2026-10-23'))
+ def test_conflicting_source_date_metadata_is_rejected(self):
+  cell=s.BeautifulSoup('<td title="2026-10-22"><time datetime="2026-10-23">yesterday</time></td>','html.parser').td
+  with self.assertRaises(ValueError):s.disclosure_day(cell)
+ def test_quote_clock_is_read_after_data_arrives(self):
+  current=datetime(2026,10,23,12,tzinfo=s.IST);chart=self.chart(current)
+  result=Mock(stdout=json.dumps([{'symbol':'TEST','cmp':102,'asof':'2026-10-23','zones':[]}]))
+  with patch.object(s,'datetime',wraps=datetime) as clock,patch.object(s,'market_cap',return_value={'cap':'700'}),patch.object(s.subprocess,'run',return_value=result):
+   clock.now.return_value=current-timedelta(minutes=30)
+   def fetch(symbol):
+    clock.now.return_value=current
+    return chart,'verified-source'
+   with patch.object(s,'prices',side_effect=fetch):value=s.scan_stock('TEST','INE000000001')
+  self.assertIn('Live session',value['quality']['quote']['kind'])
  def test_market_cap_requires_exact_stock_identity(self):
   d={'code':0,'data':[{'Sym':'TEST','Isin':'WRONG','Exch':'NSE','Mcap':99999},{'Sym':'RIGHT','Isin':'INE000000002','Exch':'NSE','Mcap':700}]}
   with patch.object(s,'cached_json',return_value=d):

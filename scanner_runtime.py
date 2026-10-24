@@ -351,7 +351,7 @@ class CompactStore(Store):
             super().save()
         finally:self.state=original
 
-def scan_stock(symbol,isin,now=None):
+def scan_stock(symbol,isin,now=None,monitored=None):
     if symbol.startswith('DUMMY') and isin.startswith('DUM'):return {'symbol':symbol,'excluded':'Official index placeholder without a tradable stock ISIN/price history'}
     cap=market_cap(symbol)
     if Decimal(cap['cap'])<=500:return {'symbol':symbol,'excluded':'Market cap <= INR 500 crore'}
@@ -372,7 +372,9 @@ def scan_stock(symbol,isin,now=None):
             data_symbol=alternative
             obj,source=prices(data_symbol);obj=augment_nse(obj,isin,OFFICIAL_NSE);payload,splits,quality=price_payload(obj,data_symbol,now or datetime.now(IST))
         else:raise
-    payload['symbol']=symbol;quality['data_symbol']=data_symbol;quality['stock_isin']=isin;quality['exchange']=exchange
+    payload['symbol']=symbol;payload['monitoredZones']=[w for w in (monitored or []) if w['stock_isin']==isin and w['exchange']==exchange and not any(d>w['registered_asof'] for d in splits)]
+    quality['zone_monitoring']={'requested':len(monitored or []),'eligible':len(payload['monitoredZones']),'held':len(monitored or [])-len(payload['monitoredZones']),'hold_reason':'Identity/exchange change or corporate split after original alert' if len(payload['monitoredZones'])!=len(monitored or []) else None}
+    quality['data_symbol']=data_symbol;quality['stock_isin']=isin;quality['exchange']=exchange
     if exchange=='BSE':quality['fallback']='NSE daily history insufficient/unavailable; all demand bands and price use the separate BSE daily series.'
     run=subprocess.run(['node',str(ROOT/'zone_runner.cjs')],input=json.dumps(payload),capture_output=True,text=True,timeout=90,check=True)
     if quality.get('official_close_source'):source=quality['official_close_source']
@@ -452,24 +454,79 @@ def migrate_pagination_identities(state):
     if held:state['held_for_evidence_review']=held
     state['pending']=pending
 
+def watch_identity(symbol,isin,exchange,z):
+    return 'zone-watch:'+hashlib.sha256(json.dumps([symbol,isin,exchange,z['tf'],z['date'],z['d'],z['p']],sort_keys=True).encode()).hexdigest()
+
+def alert_watches(stock,matched):
+    quality=stock['quality']
+    if not quality.get('stock_isin'):return []
+    return [dict(id=watch_identity(stock['symbol'],quality['stock_isin'],quality.get('exchange','NSE'),z),symbol=stock['symbol'],stock_isin=quality['stock_isin'],exchange=quality.get('exchange','NSE'),registered_asof=stock['asof'][:10],**{k:z[k] for k in ('tf','date','d','p')}) for z,_ in matched]
+
+def remember_watches(state,watches):
+    registry=state.setdefault('zone_watches',{})
+    for watch in watches:registry.setdefault(watch['id'],dict(watch))
+
+def migrate_delivered_watches(state):
+    delivered=set(state['delivered'])
+    for symbol,stock in state.get('records',{}).items():
+        matched=[(e['zone'],e['evidence']) for e in stock.get('evidence',[])]
+        if matched and match_identity(symbol,matched) in delivered:remember_watches(state,alert_watches(stock,matched))
+
+def queue_zone_breaks(state,stock):
+    if not stock['quality'].get('current_alerts_eligible',True):return
+    known=set(state['delivered'])|{p['id'] for p in state['pending']}
+    for event in stock.get('zone_breaks',[]):
+        watch=state.get('zone_watches',{}).get(event['id'])
+        if not watch or watch['symbol']!=stock['symbol'] or watch['stock_isin']!=stock['quality'].get('stock_isin') or watch['exchange']!=stock['quality'].get('exchange','NSE'):continue
+        if any(event[k]!=watch[k] for k in ('tf','date','d','p')) or event['breach_date']<=watch['registered_asof'] or not math.isfinite(event['close']) or event['close']>=watch['d']:continue
+        identity='zone-break:'+watch['id']
+        if identity in known:continue
+        text='\n'.join(['Demand zone invalidated | '+stock['symbol'],f"{watch['tf']} demand {watch['d']:.2f}–{watch['p']:.2f} | formed {watch['date']}",f"Completed {watch['tf']} candle close INR {event['close']:.2f} below distal INR {watch['d']:.2f}",'Candle last trading date '+event['breach_date']+' | Exchange '+watch['exchange'],'Update to an earlier delivered research alert. This demand setup is invalidated; other timeframe zones are assessed separately.','Price source: '+stock['price_source']])
+        state['pending'].append({'id':identity,'kind':'zone_break','text':text});known.add(identity)
+        watch['breach']=event
+
+def evidence_label(e):
+    if 'amc_id' in e:return 'Mutual fund monthly holding increase'
+    category=e.get('buyer_category','Not supplied')
+    return e['kind']+' | Buyer category as disclosed: '+category
+
+def display_evidence(items):
+    # Round-robin source types: many MF schemes must not hide exchange filings.
+    groups={}
+    for e in sorted(items,key=lambda e:(0 if e.get('date_basis')=='NSE transaction period' else 1,e['kind'],e['buyer'])):groups.setdefault(e['kind'],[]).append(e)
+    result=[]
+    while groups:
+        for kind in list(groups):
+            result.append(groups[kind].pop(0))
+            if not groups[kind]:del groups[kind]
+    return result
+
 def alert_text(stock,matched):
-    quote=stock['quality']['quote'];lines=['Institutional evidence + HTF demand',stock['symbol']+((' (quote symbol '+stock['quality']['data_symbol']+')') if stock['quality'].get('data_symbol',stock['symbol'])!=stock['symbol'] else '')+' | '+quote['kind']+' INR '+str(round(stock['cmp'],2)), 'Price as of '+quote['asof']+' | Exchange '+stock['quality'].get('exchange','NSE')]
+    quote=stock['quality']['quote'];lines=['Institutional evidence + HTF demand',stock['symbol']+' | '+quote['kind']+' INR '+str(round(stock['cmp'],2)), 'Price as of '+quote['asof']+' | Exchange '+stock['quality'].get('exchange','NSE')]
     membership=stock.get('universe_membership',{})
     if membership.get('current_source_verified') is False:lines.append('Index membership last verified '+membership['verified_at']+'; current membership source unavailable.')
     if stock['quality'].get('fallback'):lines.append(stock['quality']['fallback'])
+    lines.append('Matching timeframes: '+', '.join(dict.fromkeys(z['tf'] for z,_ in matched)))
     buyers={}
     for z,items in matched:
-        lines.append(f"{z['tf']} demand {z['d']:.2f}–{z['p']:.2f} | formed {z['date']} | {'First return' if z['firstReturn'] else 'Tested context; entry confirmation required'} | visit {z.get('latestTouch')}")
+        position=100*(stock['cmp']-z['d'])/(z['p']-z['d']) if z['p']>z['d'] else 0
+        lines.append(f"{z['tf']} demand {z['d']:.2f}–{z['p']:.2f} | formed {z['date']} | {'First return' if z['firstReturn'] else 'Tested context'} | visits {z.get('testEpisodes','unknown')} | position {position:.0f}% from distal | visit {z.get('latestTouch')}")
         for item in items:buyers[evidence_identity(item)]=item
-    for e in list(buyers.values())[:4]:
-        measure='quantity '+str(e.get('qty','not provided'))
-        if 'change' in e:measure+=' | increase '+str(e['change'])
-        if 'reported_measure' in e:measure+=' | '+e['reported_measure']
-        lines.extend([e['kind']+' | '+e['buyer'],e['start']+' → '+e['end']+' | '+measure,e['source']])
-        if e.get('date_basis')=='NSE transaction period':lines.extend([e['mode']+' | Category as disclosed: '+e.get('buyer_category','Not supplied'),'Published '+e['reported_at']])
-    if len(buyers)>4:lines.append(str(len(buyers)-4)+' additional qualifying scheme/acquisition records retained in scan state.')
-    lines.extend(['Month-end quantity change is not a verified purchase today. Known splits suppress monthly MF matches; other non-trade changes remain possible.','Demand Lab v31 OHLC-derived bands; no analyst overrides inferred. Public quotes may be delayed.','Price: Yahoo Finance / NSE final bhavcopy, as labelled above. MF: ScanX monthly quantities. Bulk/Block: Screener. Insider/SAST: NSE transaction dates.'])
-    return '\n'.join(lines)[:3950]
+    footer='Monthly MF holding changes are not confirmed same-day buys. Splits and other non-trade changes may affect holdings.\nDemand Lab v31 OHLC bands. Research match; entry confirmation required. Public quotes may be delayed.'
+    shown=0
+    for e in display_evidence(list(buyers.values())):
+        measure='Shares '+str(e.get('qty','not provided'))
+        if 'change' in e:measure+=' | holding increase '+str(e['change'])
+        if 'reported_measure' in e:measure+=' | '+str(e['reported_measure'])
+        block=[evidence_label(e),str(e['buyer'])[:180],e['start']+' → '+e['end']+' | '+measure]
+        if e.get('date_basis')=='NSE transaction period':block.extend([e['mode'],'Published '+e['reported_at']])
+        elif 'amc_id' not in e:block.append('Date basis: '+e.get('date_basis','Source trade date'))
+        block.append(e['source']);text='\n'.join(block)
+        if shown>=5 or len('\n'.join(lines))+len(text)+len(footer)+180>3950:break
+        lines.append(text);shown+=1
+    if len(buyers)>shown:lines.append(str(len(buyers)-shown)+' additional qualifying records retained in scan state.')
+    lines.append(footer)
+    return '\n'.join(lines)
 
 def deliver_pending(store,destination,limit=100):
     if verify_private_destination()!=destination:raise ValueError('Private destination changed during delivery')
@@ -478,7 +535,7 @@ def deliver_pending(store,destination,limit=100):
         item=state['pending'][0]
         response=json.loads(request('https://api.telegram.org/bot'+os.environ['BOT_TOKEN'].strip()+'/sendMessage',{'chat_id':os.environ['CHAT_ID'].strip(),'text':item['text'],'link_preview_options':{'is_disabled':True}}))
         if not response.get('ok'):raise ValueError('Telegram delivery rejected')
-        state['delivered'].append(item['id']);state['pending'].pop(0);store.save();sent+=1;time.sleep(1.1)
+        state['delivered'].append(item['id']);remember_watches(state,item.get('watches',[]));state['pending'].pop(0);store.save();sent+=1;time.sleep(1.1)
     if sent:print('PRIVATE DELIVERY',sent,'queued alerts delivered; waiting',len(state['pending']),flush=True)
     return sent
 
@@ -489,6 +546,7 @@ def main():
     state=store.state if store else {'version':1,'records':{},'pending':[],'delivered':[]}
     if destination and state.get('destination',{}).get('fingerprint')!=destination:raise ValueError('Private recipient must already be verified before full-universe scanning')
     migrate_pagination_identities(state)
+    migrate_delivered_watches(state)
     sent_earlier=deliver_pending(store,destination) if store and state['pending'] else 0
     symbols,isin,universe_status=load_universe(now,state)
     # A sample is an explicit development mode; production always attempts the whole verified membership.
@@ -543,7 +601,7 @@ def main():
     if store:store.save()
     workers=min(8,max(1,int(os.environ.get('SCANNER_WORKERS','6'))))
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        tasks={executor.submit(scan_stock,s,isin[s]):s for s in symbols}
+        tasks={executor.submit(scan_stock,s,isin[s],None,[w for w in state.get('zone_watches',{}).values() if w['symbol']==s and not w.get('breach')]):s for s in symbols}
         for task in as_completed(tasks):
             symbol=tasks[task]
             try:
@@ -551,6 +609,7 @@ def main():
                 stock['universe_membership']={k:universe_status[k] for k in ('verified_at','current_source_verified')}
                 if stock.get('excluded'):excluded.append(symbol);exclusion_reasons[symbol]=stock['excluded'];state['records'].pop(symbol,None)
                 else:
+                    queue_zone_breaks(state,stock)
                     if stock['mf_status'].get('complete') is False:source_errors.append(symbol+' MF: '+stock['mf_status']['error'])
                     mf=stock.pop('_mf');splits=stock.pop('_splits');mf_schemes+=stock['mf_status'].get('schemes',0);mf_pages+=stock['mf_status'].get('pages',0)
                     amc_ids.update(e['amc_id'] for e in mf)
@@ -564,7 +623,7 @@ def main():
                         # Route-specific history is preserved. Source identity changes, not price ticks, create a new alert.
                         identity=match_identity(symbol,matched)
                         if identity not in delivered and delivered_superset(symbol,previous,matched,delivered):state['delivered'].append(identity);delivered.add(identity)
-                        if identity not in queued and identity not in delivered:state['pending'].append({'id':identity,'text':alert_text(stock,matched)});queued.add(identity)
+                        if identity not in queued and identity not in delivered:state['pending'].append({'id':identity,'text':alert_text(stock,matched),'watches':alert_watches(stock,matched)});queued.add(identity)
                     state['records'][symbol]=stock
                 print('CHECKED',symbol,'inside',len(stock.get('zones',[])),'match',bool(stock.get('evidence')),flush=True)
             except Exception as e:
@@ -579,12 +638,15 @@ def main():
         store.save()
         sent+=deliver_pending(store,destination,max(0,100-sent))
     summary=f'Full universe attempted {len(symbols)}/{len(symbols)}; price/zone verified {len(checked)-len(excluded)}; explicitly excluded {len(excluded)}; current-price alerts suspended {len(suspended)}; unavailable {len(failed)}; matching stocks {len(matches)}; sent {sent}; waiting {len(state["pending"])}.'
+    watch_count=len(state.get('zone_watches',{}));break_count=sum(bool(w.get('breach')) for w in state.get('zone_watches',{}).values())
+    print('ZONE MONITORING',watch_count,'delivered zone contexts;',break_count,'confirmed breaches retained',flush=True)
     print(summary,flush=True)
     report={'summary':summary,'progress':state['scan_progress'],'coverage':coverage,'mf_coverage':state['mf_coverage'],'last_batch':state['last_batch'],'stocks':{s:state['records'][s] for s in checked if s in state['records']}}
     (ROOT/'full-scan-result.json').write_text(json.dumps(report,indent=2))
     if os.environ.get('GITHUB_STEP_SUMMARY'):
         with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
             f.write('## Full-universe institutional demand scan\n\n'+summary+'\n\nVerified private chat: Darpan Stock Alerts (@DarpanDemandAlerts_bot). Groups/channels blocked.\n\n')
+            f.write(f'Delivered zone contexts monitored: {watch_count}; confirmed breaches retained: {break_count}. Updates require a completed candle of the original timeframe closing below distal.\n\n')
             f.write('Live session quote when current and available; otherwise the last completed session close, including Friday over weekends. Public quotes may be delayed. Open HTF candles do not create completed formations.\n\n')
             f.write(f'Multi-AMC scheme-stock rows checked for stocks inside HTF demand: {mf_schemes}; MF pages {mf_pages}. Changes are calculated from distinct dated monthly quantities. Identical repeated months are collapsed; a zero displayed delta caused by these repetitions is not used as the change. External source omissions cannot be guaranteed away.\n\n')
             for k,v in coverage.items():f.write('- '+k+': '+json.dumps(v)+'\n')

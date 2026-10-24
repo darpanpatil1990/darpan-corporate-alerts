@@ -191,7 +191,7 @@ def price_payload(obj,symbol,now,exchange="NSE"):
         rows.append(current);asof=current[0]
         quote={'price':qp,'kind':'Live session quote (may be delayed)','asof':datetime.fromtimestamp(qt,IST).isoformat()}
     splits=[datetime.fromtimestamp(x['date'],IST).date().isoformat() for x in r.get('events',{}).get('splits',{}).values()]
-    return {'symbol':symbol,'timeframe':'Daily','rows':rows,'asof':asof,'quote':quote,'dropFirstAggregate':True,'missingDates':invalid},splits,{'invalid_rows':invalid,'rounding_repairs':rounding,'history_start':closed[0][0],'completed_asof':closed[-1][0],'quote':quote}
+    return {'symbol':symbol,'timeframe':'Daily','rows':rows,'asof':asof,'quote':quote,'dropFirstAggregate':True,'missingDates':invalid},splits,{'invalid_rows':invalid,'rounding_repairs':rounding,'history_start':closed[0][0],'completed_asof':closed[-1][0],'quote':quote,'latest_quote_date':datetime.fromtimestamp(qt,IST).date().isoformat() if qt else None,'current_alerts_eligible':not any(d>asof for d in invalid) and (not qt or asof>=datetime.fromtimestamp(qt,IST).date().isoformat())}
 
 def following_page(html,current):
     soup=BeautifulSoup(html,'html.parser');parsed=url.urlparse(current);candidates=[]
@@ -408,7 +408,7 @@ def main():
     for value in state['trades'].values():
         items=trade_evidence.setdefault(value['symbol'],[])
         if value['item'] not in items:items.append(value['item'])
-    checked=[];excluded=[];exclusion_reasons={};failed={};matches=[];mf_schemes=0;mf_pages=0;amc_ids=set();queued={p['id'] for p in state['pending']};delivered=set(state['delivered'])
+    checked=[];excluded=[];exclusion_reasons={};suspended={};failed={};matches=[];mf_schemes=0;mf_pages=0;amc_ids=set();queued={p['id'] for p in state['pending']};delivered=set(state['delivered'])
     state['scan_progress']={'started_at':now.isoformat(),'universe_size':len(symbols),'attempted':0,'complete':False}
     if store:store.save()
     workers=min(8,max(1,int(os.environ.get('SCANNER_WORKERS','6'))))
@@ -424,7 +424,8 @@ def main():
                     mf=stock.pop('_mf');splits=stock.pop('_splits');mf_schemes+=stock['mf_status'].get('schemes',0);mf_pages+=stock['mf_status'].get('pages',0)
                     amc_ids.update(e['amc_id'] for e in mf)
                     evidence=mf+trade_evidence.get(symbol,[]);matched=[]
-                    for z in stock['zones']:
+                    if not stock['quality'].get('current_alerts_eligible',True):suspended[symbol]={'validated_close_asof':stock['quality']['completed_asof'],'latest_source_quote_date':stock['quality']['latest_quote_date'],'reason':'A newer source session lacks a validated daily bar; current-price alerts are suspended.'}
+                    for z in stock['zones'] if symbol not in suspended else []:
                         items=[e for e in evidence if overlaps(z,e,stock['asof'],splits)]
                         if items:matched.append((z,items));stock['evidence'].append({'zone':z,'evidence':items})
                     if matched:
@@ -439,13 +440,13 @@ def main():
             state['scan_progress']['attempted']+=1
             if store and state['scan_progress']['attempted']%50==0:store.save()
     state['scan_progress'].update({'complete':True,'finished_at':datetime.now(IST).isoformat(),'verified':len(checked),'unavailable':len(failed),'excluded':len(excluded)})
-    state['retry_symbols']=list(failed);state['coverage']=coverage;state['last_batch']={'date':now.isoformat(),'checked':checked,'excluded':exclusion_reasons,'failed':failed,'matching':matches,'source_errors':source_errors,'universe_size':len(symbols),'full_universe_attempted':True}
+    state['retry_symbols']=list(failed);state['coverage']=coverage;state['last_batch']={'date':now.isoformat(),'checked':checked,'excluded':exclusion_reasons,'alerts_suspended':suspended,'failed':failed,'matching':matches,'source_errors':source_errors,'universe_size':len(symbols),'full_universe_attempted':True}
     state['mf_coverage']={'scheme_stock_rows':mf_schemes,'pages':mf_pages,'buying_amc_ids':sorted(amc_ids),'source':MF_API}
     sent=sent_earlier
     if store:
         store.save()
         sent+=deliver_pending(store,destination,max(0,100-sent))
-    summary=f'Full universe attempted {len(symbols)}/{len(symbols)}; price/zone verified {len(checked)-len(excluded)}; explicitly excluded {len(excluded)}; unavailable {len(failed)}; matching stocks {len(matches)}; sent {sent}; waiting {len(state["pending"])}.'
+    summary=f'Full universe attempted {len(symbols)}/{len(symbols)}; price/zone verified {len(checked)-len(excluded)}; explicitly excluded {len(excluded)}; current-price alerts suspended {len(suspended)}; unavailable {len(failed)}; matching stocks {len(matches)}; sent {sent}; waiting {len(state["pending"])}.'
     print(summary,flush=True)
     report={'summary':summary,'progress':state['scan_progress'],'coverage':coverage,'mf_coverage':state['mf_coverage'],'last_batch':state['last_batch'],'stocks':{s:state['records'][s] for s in checked if s in state['records']}}
     (ROOT/'full-scan-result.json').write_text(json.dumps(report,indent=2))
@@ -455,6 +456,7 @@ def main():
             f.write('Live session quote when current and available; otherwise the last completed session close, including Friday over weekends. Public quotes may be delayed. Open HTF candles do not create completed formations.\n\n')
             f.write(f'Multi-AMC scheme-stock rows checked for stocks inside HTF demand: {mf_schemes}; MF pages {mf_pages}. Changes are calculated from distinct dated monthly quantities. Identical repeated months are collapsed; a zero displayed delta caused by these repetitions is not used as the change. External source omissions cannot be guaranteed away.\n\n')
             for k,v in coverage.items():f.write('- '+k+': '+json.dumps(v)+'\n')
+            for symbol,reason in suspended.items():f.write('- ALERTS SUSPENDED '+symbol+': '+json.dumps(reason)+'\n')
             for symbol,reason in exclusion_reasons.items():f.write('- EXCLUDED '+symbol+': '+reason+'\n')
             for symbol,error in failed.items():f.write('- UNAVAILABLE '+symbol+': '+error+'\n')
             for error in source_errors:f.write('- SOURCE ERROR: '+error+'\n')

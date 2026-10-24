@@ -333,4 +333,46 @@ class AlertUpgradeTests(unittest.TestCase):
   self.assertEqual(check('2026-10-01',missing=['2026-09-20']),[])
   rows[2][4]=91;self.assertEqual(check('2026-10-01'),[])
 
+class TimeframeAlertTests(unittest.TestCase):
+ stock=AlertUpgradeTests.stock
+ zone=AlertUpgradeTests.zone
+ evidence=AlertUpgradeTests.evidence
+ def matches(self):
+  return [(dict(self.zone(),tf=tf),[dict(self.evidence(),buyer=tf+' buyer')]) for tf in s.TIMEFRAME_CODES]
+ def test_four_isolated_messages_and_price_tick_dedup(self):
+  state={'pending':[],'delivered':[]};matched=self.matches();queued=set();delivered=set()
+  s.queue_timeframe_alerts(state,self.stock(),matched,{},queued,delivered)
+  self.assertEqual(len(state['pending']),4)
+  for item,(tf,code) in zip(state['pending'],s.TIMEFRAME_CODES.items()):
+   self.assertTrue(item['text'].startswith(code+' | '+tf+' Demand'))
+   self.assertIn(tf+' buyer',item['text']);self.assertEqual({w['tf'] for w in item['watches']},{tf})
+   for other in s.TIMEFRAME_CODES:
+    if other!=tf:self.assertNotIn('\n'+other+' buyer\n',item['text'])
+   self.assertIn('Also matching:',item['text']);self.assertLessEqual(len(item['text']),4096)
+  s.queue_timeframe_alerts(state,dict(self.stock(),cmp=101),matched,{},queued,delivered)
+  self.assertEqual(len(state['pending']),4)
+ def test_new_proof_only_alerts_changed_timeframe(self):
+  matched=self.matches();old={'evidence':[{'zone':z,'evidence':items} for z,items in matched]}
+  ids=[s.match_identity('TEST',group) for group in s.timeframe_groups(matched).values()]
+  state={'pending':[],'delivered':ids[:]};changed=copy.deepcopy(matched);changed[1][1].append(dict(self.evidence(),buyer='New quarterly buyer'))
+  s.queue_timeframe_alerts(state,self.stock(),changed,old,set(),set(ids))
+  self.assertEqual(len(state['pending']),1);self.assertEqual(state['pending'][0]['timeframe'],'Quarterly')
+ def test_legacy_delivered_preserved_unsent_split_idempotently(self):
+  matched=self.matches();stock=self.stock();stock['evidence']=[{'zone':z,'evidence':items} for z,items in matched]
+  legacy=s.match_identity('TEST',matched)
+  state={'records':{'TEST':stock},'pending':[],'delivered':[legacy]}
+  s.migrate_timeframe_alerts(state);s.migrate_timeframe_alerts(state)
+  self.assertEqual(len(state['delivered']),5)
+  s.queue_timeframe_alerts(state,stock,matched,stock,set(),set(state['delivered']));self.assertEqual(state['pending'],[])
+  state={'records':{'TEST':stock},'pending':[{'id':legacy,'text':'Old combined'}],'delivered':[]}
+  s.migrate_timeframe_alerts(state);s.migrate_timeframe_alerts(state)
+  self.assertEqual(len(state['pending']),4);self.assertEqual(state['delivered'],[])
+ def test_removed_proof_does_not_resend(self):
+  matched=self.matches();matched[0][1].append(dict(self.evidence(),buyer='Expired proof'))
+  previous={'evidence':[{'zone':z,'evidence':items} for z,items in matched]}
+  identity=s.match_identity('TEST',[matched[0]]);current=copy.deepcopy(matched);current[0][1].pop()
+  state={'pending':[],'delivered':[identity]}
+  s.queue_timeframe_alerts(state,self.stock(),current,previous,set(),{identity})
+  self.assertEqual([item['timeframe'] for item in state['pending']],['Quarterly','Half Yearly','Yearly'])
+
 if __name__=='__main__':unittest.main()

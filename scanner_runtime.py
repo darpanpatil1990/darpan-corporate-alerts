@@ -24,6 +24,43 @@ CACHE=ROOT/'.scanner-cache'
 DISCLOSURE_GATE=threading.BoundedSemaphore(1)
 LOCKS={k:threading.BoundedSemaphore(3) for k in ('scanx','yahoo','screener')}
 
+def validate_members(members):
+    if not isinstance(members,dict) or not 450<=len(members)<=550 or len(set(members.values()))!=len(members):raise ValueError('Universe identities/count invalid')
+    for symbol,isin in members.items():
+        if not re.fullmatch(r'[A-Z0-9&_.-]+',symbol) or not re.fullmatch(r'IN[A-Z0-9]{10}',isin) and not (symbol.startswith('DUMMY') and re.fullmatch(r'DUM[A-Z0-9]{9}',isin)):
+            raise ValueError('Invalid universe stock ISIN/symbol')
+
+def load_universe(now,state):
+    """Keep dated membership proof through temporary source outages; never refresh its age on fallback."""
+    try:
+        raw=read_bytes(UNIVERSE_URL).decode('utf-8-sig');symbols=universe_from_csv(raw)
+        members={r['Symbol'].strip():r['ISIN Code'].strip() for r in csv.DictReader(io.StringIO(raw))}
+        validate_members(members)
+        snapshot={'source':UNIVERSE_URL,'verified_at':now.isoformat(),'members':members,'original_member_count':len(symbols),'omitted_placeholders':[]}
+        state['universe_snapshot']=snapshot
+        return symbols,members,dict(snapshot,current_source_verified=True,members=len(members))
+    except (OSError,ValueError,KeyError) as error:
+        failure=type(error).__name__+': '+str(error).splitlines()[0][:150]
+    snapshot=state.get('universe_snapshot')
+    if snapshot is None:
+        # Existing production versions stored each verified stock ISIN in the full scan record.
+        batch=state.get('last_batch',{});checked=batch.get('checked',[]);members={};omitted=[]
+        if not batch.get('full_universe_attempted') or batch.get('failed') or not 450<=len(checked)<=550 or len(set(checked))!=len(checked):raise ValueError('Official universe unavailable and no complete prior membership proof: '+failure)
+        for symbol in checked:
+            isin=state.get('records',{}).get(symbol,{}).get('quality',{}).get('stock_isin')
+            if isin:members[symbol]=isin
+            elif symbol.startswith('DUMMY') and 'placeholder' in batch.get('excluded',{}).get(symbol,''):omitted.append(symbol)
+            else:raise ValueError('Prior universe identity missing; refusing partial fallback')
+        snapshot={'source':UNIVERSE_URL,'verified_at':batch['date'],'members':members,'original_member_count':len(checked),'omitted_placeholders':omitted,'provenance':'Migrated from the preceding complete official-universe scan and exact stock ISINs'}
+    if snapshot.get('source')!=UNIVERSE_URL:raise ValueError('Cached universe source mismatch')
+    verified=datetime.fromisoformat(snapshot['verified_at'])
+    if verified.tzinfo is None or not 0<=now.timestamp()-verified.timestamp()<=7*86400:raise ValueError('Official universe unavailable; last verified membership exceeds 7 days')
+    members=snapshot['members'];validate_members(members)
+    state['universe_snapshot']=snapshot
+    status=dict(snapshot,current_source_verified=False,members=len(members),source_error=failure,age_hours=round((now-verified).total_seconds()/3600,2),scope='Dated last verified membership; current index additions/removals cannot be confirmed during the source outage')
+    print('UNIVERSE FALLBACK',len(members),'verified',snapshot['verified_at'],'omitted non-tradable placeholders',snapshot.get('omitted_placeholders',[]),flush=True)
+    return list(members),members,status
+
 def read_bytes(address,payload=None):
     host=url.urlparse(address).hostname or ''
     group='scanx' if 'dhan.co' in host else 'yahoo' if 'yahoo.com' in host else 'screener' if 'screener.in' in host else None
@@ -393,6 +430,8 @@ def migrate_pagination_identities(state):
 
 def alert_text(stock,matched):
     quote=stock['quality']['quote'];lines=['Institutional evidence + HTF demand',stock['symbol']+((' (quote symbol '+stock['quality']['data_symbol']+')') if stock['quality'].get('data_symbol',stock['symbol'])!=stock['symbol'] else '')+' | '+quote['kind']+' INR '+str(round(stock['cmp'],2)), 'Price as of '+quote['asof']+' | Exchange '+stock['quality'].get('exchange','NSE')]
+    membership=stock.get('universe_membership',{})
+    if membership.get('current_source_verified') is False:lines.append('Index membership last verified '+membership['verified_at']+'; current membership source unavailable.')
     if stock['quality'].get('fallback'):lines.append(stock['quality']['fallback'])
     buyers={}
     for z,items in matched:
@@ -420,16 +459,18 @@ def deliver_pending(store,destination,limit=100):
 
 def main():
     now=datetime.now(IST);dry='--dry-run' in sys.argv;destination=None if dry else verify_private_destination()
-    raw=request(UNIVERSE_URL);symbols=universe_from_csv(raw);isin={r['Symbol'].strip():r['ISIN Code'].strip() for r in csv.DictReader(io.StringIO(raw))}
-    # A sample is an explicit development mode; production always attempts the whole official universe.
-    if os.environ.get('SCANNER_TEST_LIMIT'):symbols=symbols[:int(os.environ['SCANNER_TEST_LIMIT'])]
     store=None if dry else CompactStore('institutional-confluence-state.json')
     if store:store.read()
     state=store.state if store else {'version':1,'records':{},'pending':[],'delivered':[]}
     if destination and state.get('destination',{}).get('fingerprint')!=destination:raise ValueError('Private recipient must already be verified before full-universe scanning')
     migrate_pagination_identities(state)
     sent_earlier=deliver_pending(store,destination) if store and state['pending'] else 0
-    coverage={};source_errors=[];trade_evidence={}
+    symbols,isin,universe_status=load_universe(now,state)
+    # A sample is an explicit development mode; production always attempts the whole verified membership.
+    if os.environ.get('SCANNER_TEST_LIMIT'):symbols=symbols[:int(os.environ['SCANNER_TEST_LIMIT'])]
+    if store:store.save()
+    coverage={'Nifty 500 membership':universe_status};source_errors=[];trade_evidence={}
+    if not universe_status['current_source_verified']:source_errors.append('Nifty membership source unavailable; dated verified membership used: '+universe_status['verified_at'])
     try:
         cap_data,cap_status=load_scanx_caps(isin);CAP_LOOKUP.update(cap_data);coverage['Market cap']=cap_status
         print('MARKET CAPS exact official identities',len(cap_data),'/',len(isin),flush=True)
@@ -478,6 +519,7 @@ def main():
             symbol=tasks[task]
             try:
                 stock=task.result();checked.append(symbol)
+                stock['universe_membership']={k:universe_status[k] for k in ('verified_at','current_source_verified')}
                 if stock.get('excluded'):excluded.append(symbol);exclusion_reasons[symbol]=stock['excluded'];state['records'].pop(symbol,None)
                 else:
                     if stock['mf_status'].get('complete') is False:source_errors.append(symbol+' MF: '+stock['mf_status']['error'])

@@ -14,9 +14,12 @@ from institutional_confluence import (Store, request, UNIVERSE_URL, universe_fro
 MF_API='https://ow-static-scanx.dhan.co/staticscanx/mfpastholdingsbyisin'
 CAP_API='https://ow-scanx-analytics.dhan.co/customscan/fetchdt'
 CAP_LOOKUP={}
+# Yahoo search identifies this NSE REIT series explicitly; bind the alias to its stock ISIN.
+YAHOO_QUOTE_ALIASES={'BAGMANE':('INE2OVN25015','BAGMANE-RR')}
 AMC_API='https://ow-static-scanx.dhan.co/staticscanx/amclist_v2'
 ROOT=Path(__file__).resolve().parent
 CACHE=ROOT/'.scanner-cache'
+DISCLOSURE_GATE=threading.BoundedSemaphore(1)
 LOCKS={k:threading.BoundedSemaphore(3) for k in ('scanx','yahoo','screener')}
 
 def read_bytes(address,payload=None):
@@ -52,17 +55,19 @@ def load_scanx_caps(official_isins):
     query={'data':{'sorder':'desc','sort':'Mcap','count':1000,'fields':['Sym','Isin','Mcap','Exch','Sid','Seosym'],'params':[{'field':'Exch','op':'','val':'NSE'}],'logic_op':'AND','pgno':1}}
     data=cached_json('universe','scanx-caps',6*3600,lambda:json.loads(read_bytes(CAP_API,query)))
     if data.get('code')!=0 or not isinstance(data.get('data'),list):raise ValueError('ScanX market-cap source unavailable')
-    result={}
+    result={};official_by_isin={v:k for k,v in official_isins.items()}
+    if len(official_by_isin)!=len(official_isins):raise ValueError('Official stock ISINs are not unique')
     for row in data['data']:
         if not isinstance(row,dict):raise ValueError('ScanX market-cap schema changed')
         symbol=row.get('Sym');isin=row.get('Isin')
-        if row.get('Exch')!='NSE' or symbol not in official_isins or official_isins[symbol]!=isin:continue
+        if row.get('Exch')!='NSE' or isin not in official_by_isin or not re.fullmatch(r'[A-Z0-9&.\-]+',str(symbol)):continue
+        canonical=official_by_isin[isin]
         cap=Decimal(str(row.get('Mcap')))
         if not cap.is_finite() or cap<=0:continue
-        value={'cap':str(cap),'source':CAP_API,'stock_isin':isin,'units':'INR crore','provider_asof':data.get('last_resp_time')}
-        if symbol in result and result[symbol]!=value:raise ValueError('Conflicting ScanX market-cap records')
-        result[symbol]=value
-    return result,{'source':CAP_API,'exact_symbol_isin_matches':len(result),'official_universe':len(official_isins),'fallback_symbols':sorted(set(official_isins)-set(result)),'scope':'Provider top 1000 by market cap; each universe member individually verified by NSE symbol and stock ISIN. Missing identities use the independent Screener check.'}
+        value={'cap':str(cap),'source':CAP_API,'stock_isin':isin,'provider_symbol':symbol,'units':'INR crore','provider_asof':data.get('last_resp_time')}
+        if canonical in result and result[canonical]!=value:raise ValueError('Conflicting ScanX market-cap records')
+        result[canonical]=value
+    return result,{'source':CAP_API,'exact_isin_matches':len(result),'symbol_aliases':{k:v['provider_symbol'] for k,v in result.items() if k!=v['provider_symbol']},'official_universe':len(official_isins),'fallback_symbols':sorted(set(official_isins)-set(result)),'scope':'Provider top 1000 by market cap; each universe member individually verified by its exact stock ISIN on NSE. Unique same-ISIN symbol changes are recorded as aliases. Missing identities use the independent Screener check.'}
 
 def market_cap(symbol):
     if symbol in CAP_LOOKUP:return CAP_LOOKUP[symbol]
@@ -202,7 +207,7 @@ def following_page(html,current):
         if p.scheme=='https' and p.hostname==parsed.hostname and p.path==parsed.path and target!=current:return target
     return None
 
-def disclosure_dates(html):
+def disclosure_dates(html,normalize=False):
     soup=BeautifulSoup(html,'html.parser');table=soup.select_one('table#result_list') or soup.select_one('main table')
     if table is None:raise ValueError('Disclosure table unavailable')
     heads=[h.get_text(' ',strip=True).lower() for h in table.select('thead th')]
@@ -212,30 +217,51 @@ def disclosure_dates(html):
     dates=[]
     for row in table.select('tbody tr'):
         cells=row.find_all(['td','th'],recursive=False)
-        if len(cells)==len(heads):dates.append(day(cells[index].get_text(' ',strip=True)))
-    return dates
+        if len(cells)==len(heads):
+            raw=cells[index].get_text(' ',strip=True)
+            cleaned=re.sub(r'\b([A-Za-z]{3,4})\.',r'\1',raw).replace('Sept ','Sep ').replace(',',' ')
+            try:parsed=day(cleaned)
+            except ValueError:raise ValueError('Unrecognised disclosure date: '+raw[:50])
+            dates.append(parsed)
+            if normalize:cells[index].clear();cells[index].append(parsed.isoformat())
+    return (str(soup),dates) if normalize else dates
+
+def disclosure_page(client,target):
+    for attempt in range(3):
+        try:
+            with DISCLOSURE_GATE:
+                time.sleep(.6)
+                with client.open(target,timeout=20) as response:
+                    if url.urlparse(response.url).path!=url.urlparse(target).path:raise ValueError('Disclosure access redirected')
+                    return response.read().decode()
+        except urllib.error.HTTPError as e:
+            wait=e.headers.get('Retry-After','15')
+            if e.code!=429 or attempt==2 or not wait.isdigit() or int(wait)>60:raise
+            time.sleep(max(1,int(wait)))
 
 def read_disclosures(kind,path,symbols,today,deadline):
     client=login();target=BASE+path;seen=set();records=[];rows=0;last=None;descending=True
     cutoff=today-timedelta(days=45);reason=''
-    while target:
-        if time.monotonic()>deadline:raise ValueError('Disclosure time limit; recent-history coverage incomplete')
-        if target in seen:raise ValueError('Disclosure pagination loop')
-        if len(seen)>=500:raise ValueError('Disclosure pagination limit; coverage incomplete')
-        with client.open(target,timeout=30) as response:
-            if url.urlparse(response.url).path!=url.urlparse(target).path:raise ValueError('Disclosure access redirected')
-            html=response.read().decode()
-        seen.add(target);dates=disclosure_dates(html);rows+=len(dates)
-        if len(seen)%25==0:print('DISCLOSURE',kind,'pages',len(seen),'rows',rows,'oldest',str(min(dates)) if dates else 'none',flush=True)
-        descending=descending and all(a>=b for a,b in zip(dates,dates[1:])) and (last is None or not dates or last>=max(dates))
-        if dates:last=min(dates)
-        records.extend(trade_rows(html,kind,symbols,today,target))
-        nxt=following_page(html,target)
-        if nxt is None:reason='all available pages';break
-        if dates and max(dates)<cutoff and descending:reason='all pages through the 45-day acquisition window';break
-        target=nxt;time.sleep(.15)
+    complete=True
+    try:
+        while target:
+            if time.monotonic()>deadline:raise ValueError('Disclosure time limit; recent-history coverage incomplete')
+            if target in seen:raise ValueError('Disclosure pagination loop')
+            if len(seen)>=500:raise ValueError('Disclosure pagination limit; coverage incomplete')
+            html=disclosure_page(client,target)
+            seen.add(target);html,dates=disclosure_dates(html,normalize=True);rows+=len(dates)
+            if len(seen)%25==0:print('DISCLOSURE',kind,'pages',len(seen),'rows',rows,'oldest',str(min(dates)) if dates else 'none',flush=True)
+            descending=descending and all(a>=b for a,b in zip(dates,dates[1:])) and (last is None or not dates or last>=max(dates))
+            if dates:last=min(dates)
+            records.extend(trade_rows(html,kind,symbols,today,target))
+            nxt=following_page(html,target)
+            if nxt is None:reason='all available pages';break
+            if dates and max(dates)<cutoff and descending:reason='all pages through the 45-day acquisition window';break
+            target=nxt;time.sleep(.15)
+    except Exception as e:
+        complete=False;reason=type(e).__name__+': '+str(e)[:160]
     unique={hashlib.sha256(json.dumps([s,e],sort_keys=True).encode()).hexdigest():(s,e) for s,e in records}
-    return list(unique.values()),{'pages':len(seen),'rows':rows,'complete':True,'scope':reason,'start':cutoff.isoformat(),'end':today.isoformat()}
+    return list(unique.values()),{'pages':len(seen),'rows':rows,'complete':complete,'scope':reason,'start':cutoff.isoformat(),'end':today.isoformat()}
 
 class CompactStore(Store):
     def read(self):
@@ -253,9 +279,14 @@ class CompactStore(Store):
         finally:self.state=original
 
 def scan_stock(symbol,isin,now):
+    if symbol.startswith('DUMMY') and isin.startswith('DUM'):return {'symbol':symbol,'excluded':'Official index placeholder without a tradable stock ISIN/price history'}
     cap=market_cap(symbol)
     if Decimal(cap['cap'])<=500:return {'symbol':symbol,'excluded':'Market cap <= INR 500 crore'}
-    obj,source=prices(symbol);payload,splits,quality=price_payload(obj,symbol,now)
+    data_symbol=cap.get('provider_symbol',symbol)
+    verified_alias=YAHOO_QUOTE_ALIASES.get(symbol)
+    if verified_alias and verified_alias[0]==isin:data_symbol=verified_alias[1]
+    obj,source=prices(data_symbol);payload,splits,quality=price_payload(obj,data_symbol,now)
+    payload['symbol']=symbol;quality['data_symbol']=data_symbol;quality['stock_isin']=isin
     run=subprocess.run(['node',str(ROOT/'zone_runner.cjs')],input=json.dumps(payload),capture_output=True,text=True,timeout=90,check=True)
     stock=json.loads(run.stdout)[0];stock.update({'price_source':source,'market_cap_cr':cap['cap'],'quality':quality,'evidence':[]})
     if stock['zones']:
@@ -268,7 +299,7 @@ def scan_stock(symbol,isin,now):
     return stock
 
 def alert_text(stock,matched):
-    quote=stock['quality']['quote'];lines=['Institutional evidence + HTF demand',stock['symbol']+' | '+quote['kind']+' INR '+str(round(stock['cmp'],2)), 'Price as of '+quote['asof']]
+    quote=stock['quality']['quote'];lines=['Institutional evidence + HTF demand',stock['symbol']+((' (quote symbol '+stock['quality']['data_symbol']+')') if stock['quality'].get('data_symbol',stock['symbol'])!=stock['symbol'] else '')+' | '+quote['kind']+' INR '+str(round(stock['cmp'],2)), 'Price as of '+quote['asof']]
     buyers={}
     for z,items in matched:
         lines.append(f"{z['tf']} demand {z['d']:.2f}–{z['p']:.2f} | formed {z['date']} | {'First return' if z['firstReturn'] else 'Tested context; entry confirmation required'} | visit {z.get('latestTouch')}")
@@ -308,15 +339,18 @@ def main():
         cap_data,cap_status=load_scanx_caps(isin);CAP_LOOKUP.update(cap_data);coverage['Market cap']=cap_status
         print('MARKET CAPS exact official identities',len(cap_data),'/',len(isin),flush=True)
     except Exception as e:coverage['Market cap']={'source':CAP_API,'fallback':'Independent Screener identity checks','error':type(e).__name__+': '+str(e)[:120]}
+    aliases={v['provider_symbol']:k for k,v in CAP_LOOKUP.items() if v['provider_symbol']!=k}
+    trade_symbols=list(dict.fromkeys(symbols+list(aliases)))
     deadline=time.monotonic()+18*60
     if not dry:
         with ThreadPoolExecutor(max_workers=4) as executor:
-            tasks={executor.submit(read_disclosures,kind,path,symbols,now.date(),deadline):kind for kind,path in TRADE_PATHS.items()}
+            tasks={executor.submit(read_disclosures,kind,path,trade_symbols,now.date(),deadline):kind for kind,path in TRADE_PATHS.items()}
             for task in as_completed(tasks):
                 kind=tasks[task]
                 try:
                     records,status=task.result();coverage[kind]=status
-                    for symbol,item in records:trade_evidence.setdefault(symbol,[]).append(item)
+                    if not status['complete']:source_errors.append(kind+': '+status['scope'])
+                    for symbol,item in records:trade_evidence.setdefault(aliases.get(symbol,symbol),[]).append(item)
                 except Exception as e:source_errors.append(kind+': '+type(e).__name__+' '+str(e)[:160]);coverage[kind]={'complete':False,'error':str(e)[:160]}
     try:
         amcs=json.loads(read_bytes(AMC_API));coverage['MF provider']={'source':AMC_API,'code':amcs.get('code'),'fund_houses':len(amcs.get('data',[])),'schemes':sum(len(a.get('scheme',[])) for a in amcs.get('data',[])),'scope':'Every returned scheme page for each stock currently inside an HTF demand zone; all fund houses supplied by the provider. Provider omissions cannot be ruled out.'}
@@ -329,7 +363,7 @@ def main():
     for value in state['trades'].values():
         items=trade_evidence.setdefault(value['symbol'],[])
         if value['item'] not in items:items.append(value['item'])
-    checked=[];excluded=[];failed={};matches=[];mf_schemes=0;mf_pages=0;amc_ids=set();queued={p['id'] for p in state['pending']};delivered=set(state['delivered'])
+    checked=[];excluded=[];exclusion_reasons={};failed={};matches=[];mf_schemes=0;mf_pages=0;amc_ids=set();queued={p['id'] for p in state['pending']};delivered=set(state['delivered'])
     state['scan_progress']={'started_at':now.isoformat(),'universe_size':len(symbols),'attempted':0,'complete':False}
     if store:store.save()
     workers=min(8,max(1,int(os.environ.get('SCANNER_WORKERS','6'))))
@@ -339,7 +373,7 @@ def main():
             symbol=tasks[task]
             try:
                 stock=task.result();checked.append(symbol)
-                if stock.get('excluded'):excluded.append(symbol);state['records'].pop(symbol,None)
+                if stock.get('excluded'):excluded.append(symbol);exclusion_reasons[symbol]=stock['excluded'];state['records'].pop(symbol,None)
                 else:
                     if stock['mf_status'].get('complete') is False:source_errors.append(symbol+' MF: '+stock['mf_status']['error'])
                     mf=stock.pop('_mf');splits=stock.pop('_splits');mf_schemes+=stock['mf_status'].get('schemes',0);mf_pages+=stock['mf_status'].get('pages',0)
@@ -361,13 +395,13 @@ def main():
             state['scan_progress']['attempted']+=1
             if store and state['scan_progress']['attempted']%50==0:store.save()
     state['scan_progress'].update({'complete':True,'finished_at':datetime.now(IST).isoformat(),'verified':len(checked),'unavailable':len(failed),'excluded':len(excluded)})
-    state['retry_symbols']=list(failed);state['coverage']=coverage;state['last_batch']={'date':now.isoformat(),'checked':checked,'failed':failed,'matching':matches,'source_errors':source_errors,'universe_size':len(symbols),'full_universe_attempted':True}
+    state['retry_symbols']=list(failed);state['coverage']=coverage;state['last_batch']={'date':now.isoformat(),'checked':checked,'excluded':exclusion_reasons,'failed':failed,'matching':matches,'source_errors':source_errors,'universe_size':len(symbols),'full_universe_attempted':True}
     state['mf_coverage']={'scheme_stock_rows':mf_schemes,'pages':mf_pages,'buying_amc_ids':sorted(amc_ids),'source':MF_API}
     sent=sent_earlier
     if store:
         store.save()
         sent+=deliver_pending(store,destination,max(0,100-sent))
-    summary=f'Full universe attempted {len(symbols)}/{len(symbols)}; verified {len(checked)}; excluded cap<=500Cr {len(excluded)}; unavailable {len(failed)}; matching stocks {len(matches)}; sent {sent}; waiting {len(state["pending"])}.'
+    summary=f'Full universe attempted {len(symbols)}/{len(symbols)}; price/zone verified {len(checked)-len(excluded)}; explicitly excluded {len(excluded)}; unavailable {len(failed)}; matching stocks {len(matches)}; sent {sent}; waiting {len(state["pending"])}.'
     print(summary,flush=True)
     report={'summary':summary,'progress':state['scan_progress'],'coverage':coverage,'mf_coverage':state['mf_coverage'],'last_batch':state['last_batch'],'stocks':{s:state['records'][s] for s in checked if s in state['records']}}
     (ROOT/'full-scan-result.json').write_text(json.dumps(report,indent=2))
@@ -377,6 +411,7 @@ def main():
             f.write('Live session quote when current and available; otherwise the last completed session close, including Friday over weekends. Public quotes may be delayed. Open HTF candles do not create completed formations.\n\n')
             f.write(f'Multi-AMC scheme-stock rows checked for stocks inside HTF demand: {mf_schemes}; MF pages {mf_pages}. Changes are calculated from distinct dated monthly quantities. Identical repeated months are collapsed; a zero displayed delta caused by these repetitions is not used as the change. External source omissions cannot be guaranteed away.\n\n')
             for k,v in coverage.items():f.write('- '+k+': '+json.dumps(v)+'\n')
+            for symbol,reason in exclusion_reasons.items():f.write('- EXCLUDED '+symbol+': '+reason+'\n')
             for symbol,error in failed.items():f.write('- UNAVAILABLE '+symbol+': '+error+'\n')
             for error in source_errors:f.write('- SOURCE ERROR: '+error+'\n')
             f.write('\nMonthly quantity changes are not proof of same-day exchange purchases. All alerts remain dated research matches, with tested contexts separately labelled.\n')

@@ -75,6 +75,18 @@ class RuntimeTests(unittest.TestCase):
   with patch.object(s,'login',return_value=Mock()),patch.object(s,'disclosure_page',side_effect=[html,ValueError('Source unavailable')]),patch.object(s.time,'sleep'):
    records,status=s.read_disclosures('Bulk','/trades/bulk/', ['TEST'],s.day('2026-10-24'),s.time.monotonic()+60)
   self.assertEqual(len(records),1);self.assertFalse(status['complete']);self.assertIn('Source unavailable',status['scope'])
+ def test_provider_rename_keeps_established_price_history(self):
+  now=datetime(2026,10,23,17,tzinfo=s.IST)
+  result=Mock(stdout=json.dumps([{'symbol':'TEST','cmp':101,'asof':'2026-10-23','zones':[]}]))
+  with patch.object(s,'market_cap',return_value={'cap':'700','provider_symbol':'RENAMED'}),patch.object(s,'prices',return_value=(self.chart(now),'verified-source')) as prices,patch.object(s.subprocess,'run',return_value=result):
+   value=s.scan_stock('TEST','INE000000001',now)
+  prices.assert_called_once_with('TEST');self.assertEqual(value['quality']['completed_asof'],'2026-10-23')
+ def test_exchange_series_cannot_be_mixed(self):
+  now=datetime(2026,10,23,17,tzinfo=s.IST);d=self.chart(now)
+  with self.assertRaises(ValueError):s.price_payload(d,'TEST',now,'BSE')
+  d['chart']['result'][0]['meta']['symbol']='TEST.BO'
+  payload,_,_=s.price_payload(d,'TEST',now,'BSE')
+  self.assertEqual(payload['quote']['asof'],'2026-10-23')
  def test_market_cap_requires_exact_stock_identity(self):
   d={'code':0,'data':[{'Sym':'TEST','Isin':'WRONG','Exch':'NSE','Mcap':99999},{'Sym':'RIGHT','Isin':'INE000000002','Exch':'NSE','Mcap':700}]}
   with patch.object(s,'cached_json',return_value=d):

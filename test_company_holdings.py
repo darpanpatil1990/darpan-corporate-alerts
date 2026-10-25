@@ -59,6 +59,29 @@ class OwnershipTests(unittest.TestCase):
                 request('https://api.telegram.org/', {'text': 'test'})
         self.assertEqual(mocked.call_count, 1)
 
+    def test_transient_network_reads_recover_with_bounded_backoff(self):
+        from unittest.mock import MagicMock
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"ok":true}'
+        errors = [urllib.error.URLError('temporary outage'), TimeoutError(), response]
+        with patch('company_holdings.urllib.request.urlopen', side_effect=errors) as mocked, patch('company_holdings.time.sleep') as sleep:
+            self.assertEqual(request('https://example.test/data'), '{"ok":true}')
+        self.assertEqual(mocked.call_count, 3)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [2, 4])
+
+    def test_persistent_network_read_stops_after_three_attempts(self):
+        with patch('company_holdings.urllib.request.urlopen', side_effect=urllib.error.URLError('outage')) as mocked, patch('company_holdings.time.sleep'):
+            with self.assertRaises(urllib.error.URLError):
+                request('https://example.test/data')
+        self.assertEqual(mocked.call_count, 3)
+
+    def test_ambiguous_delivery_timeout_is_not_replayed(self):
+        with patch('company_holdings.urllib.request.urlopen', side_effect=TimeoutError()) as mocked:
+            with self.assertRaises(TimeoutError):
+                request('https://api.telegram.org/', {'text': 'test'})
+        self.assertEqual(mocked.call_count, 1)
+
 
 if __name__ == '__main__':
     unittest.main()
+

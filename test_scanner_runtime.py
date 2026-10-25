@@ -425,9 +425,57 @@ console.log('Best level gates passed');
   fixture=AlertUpgradeTests();stock=fixture.stock();z=fixture.zone()
   ref={'parentTF':'Monthly','parentDate':z['date'],'parentD':z['d'],'parentP':z['p'],'trendTF':'Weekly','trend':'Up','entryTF':'Daily','status':'WAIT_RETEST','zoneDate':'2026-09-01','distal':95,'proximal':105,'entryReference':105,'stopReference':95,'targets':[{'rr':r,'price':105+r*10} for r in (2,3,4)]}
   ref['achievementKeypoints']=[{'tf':'Quarterly','proximal':100,'date':'2026-01-01','grade':0}];stock['entry_references']=[ref];items=[dict(fixture.evidence(),buyer='Fund '+str(i)+'x'*170) for i in range(30)]
-  msg=s.timeframe_alert(stock,'Monthly',[(z,items)],[(z,items)])
+  msg={'text':s.entry_reference_text(stock,'Monthly',[(z,items)])}
   self.assertIn('NOT Entry Ready',msg['text']);self.assertIn('SL boundary INR 95.00',msg['text']);self.assertIn('1:2 125.00',msg['text']);self.assertIn('Buffers, risk sizing',msg['text']);self.assertIn('HTF support:',msg['text']);self.assertNotIn('HTF achievement:',msg['text']);self.assertLessEqual(len(msg['text']),4096)
   other=s.entry_reference_text(stock,'Quarterly',[(dict(z,tf='Quarterly'),items)])
   self.assertNotIn('105.00',other)
+
+class SeparateEntryAlertTests(unittest.TestCase):
+ def fixture(self):
+  f=AlertUpgradeTests();stock=f.stock();z=f.zone();matched=[(z,[f.evidence()])]
+  ref={'parentTF':'Monthly','parentDate':z['date'],'parentD':z['d'],'parentP':z['p'],'location':'Very Low','trendTF':'Weekly','trend':'Up','entryTF':'Daily','status':'WAIT_SUPPLY_CLOSE','zoneDate':'2026-09-01','distal':95,'proximal':105,'entryReference':105,'stopReference':95,'achievement':1,'achievementKeypoints':[{'tf':'Quarterly','proximal':100,'date':'2026-01-01','grade':0}],'targets':[{'rr':r,'price':105+r*10} for r in (2,3,4)]}
+  stock['entry_references']=[ref]
+  return stock,matched,ref
+ def queue(self,state,stock,matched,previous=None):
+  s.queue_timeframe_alerts(state,stock,matched,previous or {},{p['id'] for p in state['pending']},set(state['delivered']))
+ def test_original_not_blocked_by_any_missing_entry_condition(self):
+  for status in ('WAIT_HTF_LOCATION','WAIT_TREND','WAIT_ENTRY_ZONE','WAIT_ACHIEVEMENT_LEVEL','WAIT_ENTRY_ACHIEVEMENT'):
+   stock,matched,ref=self.fixture();ref['status']=status;state={'pending':[],'delivered':[]}
+   self.queue(state,stock,matched)
+   self.assertEqual([p['kind'] for p in state['pending']],['timeframe_match'])
+   self.assertIn('Institutional evidence + HTF demand',state['pending'][0]['text'])
+   self.assertNotIn('SL boundary',state['pending'][0]['text'])
+ def test_followup_arrives_after_original_already_delivered_and_price_dedup(self):
+  stock,matched,ref=self.fixture();state={'pending':[],'delivered':[s.match_identity(stock['symbol'],matched)]}
+  self.queue(state,stock,matched);self.assertEqual([p['kind'] for p in state['pending']],['entry_setup'])
+  item=state['pending'].pop();state['delivered'].append(item['id']);stock['cmp']=101;ref['scoreComponents']={'score':999}
+  self.queue(state,stock,matched);self.assertEqual(state['pending'],[])
+  self.assertIn('NOT Entry Ready',item['text']);self.assertIn('SL boundary INR 95.00',item['text']);self.assertIn('https://scanx.trade/',item['text'])
+ def test_status_progression_once_and_entry_survives_migration(self):
+  stock,matched,ref=self.fixture();state={'records':{},'pending':[],'delivered':[s.match_identity(stock['symbol'],matched)]}
+  for status in ('WAIT_SUPPLY_CLOSE','WAIT_RETEST','REVIEW_REQUIRED'):
+   ref['status']=status;self.queue(state,stock,matched)
+  self.assertEqual(len(state['pending']),3)
+  s.migrate_timeframe_alerts(state);self.assertEqual(len(state['pending']),3)
+  state['delivered'].extend(p['id'] for p in state['pending']);state['pending']=[]
+  ref['status']='WAIT_RETEST';self.queue(state,stock,matched);self.assertEqual(state['pending'],[])
+ def test_support_achievement_trend_and_parent_gates(self):
+  for changes in ({'achievement':0},{'achievement':float('nan')},{'trend':'Down'},{'location':'Middle'},{'achievementKeypoints':[]},{'achievementKeypoints':[{'proximal':120}]},{'entryTF':'Weekly'},{'parentDate':'2020-01-01'}):
+   stock,matched,ref=self.fixture();ref.update(changes);self.assertEqual(list(s.entry_setup_alerts(stock,'Monthly',matched)),[])
+ def test_new_entry_level_and_visit_are_distinct_not_new_evidence(self):
+  stock,matched,ref=self.fixture();first=list(s.entry_setup_alerts(stock,'Monthly',matched))[0]['id']
+  matched[0][1].append(dict(matched[0][1][0],buyer='Another fund'))
+  self.assertEqual(first,list(s.entry_setup_alerts(stock,'Monthly',matched))[0]['id'])
+  ref['zoneDate']='2026-09-02';second=list(s.entry_setup_alerts(stock,'Monthly',matched))[0]['id'];self.assertNotEqual(first,second)
+  matched[0][0]['latestTouch']='2026-09-14';self.assertNotEqual(second,list(s.entry_setup_alerts(stock,'Monthly',matched))[0]['id'])
+ def test_four_timeframes_isolated_and_long_evidence_fits(self):
+  f=AlertUpgradeTests()
+  for tf,(trend,entry) in {'Monthly':('Weekly','Daily'),'Quarterly':('Monthly','Weekly'),'Half Yearly':('Quarterly','Monthly'),'Yearly':('Half Yearly','Quarterly')}.items():
+   stock,matched,ref=self.fixture();matched[0][0]['tf']=tf;ref.update(parentTF=tf,trendTF=trend,entryTF=entry)
+   matched[0][1].extend(dict(f.evidence(),buyer='Fund '+str(i)+'x'*170) for i in range(30))
+   state={'pending':[],'delivered':[]};self.queue(state,stock,matched)
+   self.assertEqual([p['kind'] for p in state['pending']],['timeframe_match','entry_setup'])
+   for item in state['pending']:
+    self.assertTrue(item['text'].startswith(s.TIMEFRAME_CODES[tf]+' |'));self.assertLessEqual(len(item['text']),4096)
 
 if __name__=='__main__':unittest.main()

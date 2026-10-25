@@ -447,7 +447,7 @@ class SeparateEntryAlertTests(unittest.TestCase):
    self.assertNotIn('SL boundary',state['pending'][0]['text'])
  def test_followup_arrives_after_original_already_delivered_and_price_dedup(self):
   stock,matched,ref=self.fixture();state={'pending':[],'delivered':[s.match_identity(stock['symbol'],matched)]}
-  self.queue(state,stock,matched);self.assertEqual([p['kind'] for p in state['pending']],['entry_setup'])
+  self.queue(state,stock,matched);self.assertEqual([p['kind'] for p in state['pending']],['combined_entry_setup'])
   item=state['pending'].pop();state['delivered'].append(item['id']);stock['cmp']=101;ref['scoreComponents']={'score':999}
   self.queue(state,stock,matched);self.assertEqual(state['pending'],[])
   self.assertIn('NOT Entry Ready',item['text']);self.assertIn('SL boundary INR 95.00',item['text']);self.assertIn('https://scanx.trade/',item['text'])
@@ -474,8 +474,63 @@ class SeparateEntryAlertTests(unittest.TestCase):
    stock,matched,ref=self.fixture();matched[0][0]['tf']=tf;ref.update(parentTF=tf,trendTF=trend,entryTF=entry)
    matched[0][1].extend(dict(f.evidence(),buyer='Fund '+str(i)+'x'*170) for i in range(30))
    state={'pending':[],'delivered':[]};self.queue(state,stock,matched)
-   self.assertEqual([p['kind'] for p in state['pending']],['timeframe_match','entry_setup'])
+   self.assertEqual([p['kind'] for p in state['pending']],['timeframe_match','combined_entry_setup'])
    for item in state['pending']:
-    self.assertTrue(item['text'].startswith(s.TIMEFRAME_CODES[tf]+' |'));self.assertLessEqual(len(item['text']),4096)
+    self.assertTrue(item['text'].startswith(s.TIMEFRAME_CODES[tf]+' |') if item['kind']=='timeframe_match' else item['text'].startswith('Combined Best Entry Setup'));self.assertLessEqual(len(item['text']),4096)
+
+class CombinedEntryAlertTests(unittest.TestCase):
+ fixture=SeparateEntryAlertTests.fixture
+ queue=SeparateEntryAlertTests.queue
+ def multi(self):
+  stock,matched,ref=self.fixture();stock['zones']=[matched[0][0]]
+  for tf,trend,entry,d,p in [('Quarterly','Monthly','Weekly',92,112),('Half Yearly','Quarterly','Monthly',94,114),('Yearly','Half Yearly','Quarterly',96,116)]:
+   zone=dict(matched[0][0],tf=tf,d=d,p=p);stock['zones'].append(zone)
+   stock['entry_references'].append(dict(ref,parentTF=tf,parentD=d,parentP=p,trendTF=trend,entryTF=entry,achievementKeypoints=[dict(ref['achievementKeypoints'][0],tf='Yearly')]))
+   matched.append((zone,[dict(matched[0][1][0],buyer=tf+' buyer')]))
+  return stock,matched
+ def test_all_four_opportunities_but_one_combined_entry(self):
+  stock,matched=self.multi();state={'pending':[],'delivered':[]};self.queue(state,stock,matched)
+  self.assertEqual([p['kind'] for p in state['pending']],['timeframe_match']*4+['combined_entry_setup'])
+  text=state['pending'][-1]['text'];self.assertIn('MIT, QIT, HIT, YIT',text);self.assertIn('Common demand overlap: 96.00–110.00',text)
+  self.assertEqual(text.count('Alternative:'),3);self.assertIn('NOT Entry Ready',text);self.assertLessEqual(len(text),4096)
+ def test_rank_support_then_achievement_then_closing(self):
+  stock,matched=self.multi();refs=stock['entry_references'];refs[1]['achievement']=2
+  text=s.combined_entry_alert(stock,matched)['text'];self.assertIn('Best qualified path: Quarterly demand',text)
+  refs[0]['achievementKeypoints'].append(dict(refs[0]['achievementKeypoints'][0],tf='Half Yearly'))
+  text=s.combined_entry_alert(stock,matched)['text'];self.assertIn('Best qualified path: Monthly demand',text)
+  refs[0]['achievementKeypoints'].pop();refs[1]['achievement']=1;refs[2]['closing']='Strong'
+  self.assertIn('Best qualified path: Half Yearly demand',s.combined_entry_alert(stock,matched)['text'])
+ def test_no_borrowing_uptrend_or_achievement_from_other_path(self):
+  stock,matched=self.multi()
+  for ref in stock['entry_references']:ref['achievement']=0
+  stock['entry_references'][0]['achievement']=3;stock['entry_references'][0]['trend']='Down'
+  self.assertIsNone(s.combined_entry_alert(stock,matched))
+  stock['entry_references'][1]['achievement']=1
+  self.assertIn('Best qualified path: Quarterly demand',s.combined_entry_alert(stock,matched)['text'])
+ def test_all_price_supports_can_supply_entry_but_proof_is_not_reassigned(self):
+  stock,matched=self.multi();matched=matched[:1]
+  stock['entry_references'][0]['trend']='Down'
+  text=s.combined_entry_alert(stock,matched)['text']
+  self.assertIn('Best qualified path: Quarterly demand',text)
+  self.assertIn('Buying evidence matched to: MIT.',text);self.assertIn('Other HTF bands are price support',text)
+ def test_order_price_evidence_changes_do_not_resend(self):
+  stock,matched=self.multi();first=s.combined_entry_alert(stock,matched)['id'];stock['cmp']=101
+  stock['entry_references'].reverse();stock['zones'].reverse();matched.reverse();matched[0][1].append(dict(matched[0][1][0],buyer='New proof'))
+  self.assertEqual(first,s.combined_entry_alert(stock,matched)['id'])
+ def test_failed_price_or_absent_evidence_suppresses_combined(self):
+  stock,matched=self.multi();self.assertIsNone(s.combined_entry_alert(stock,[]))
+  stock['quality']['current_alerts_eligible']=False;self.assertIsNone(s.combined_entry_alert(stock,matched))
+ def test_legacy_pending_entry_is_retained_but_not_sent(self):
+  old={'id':'entry-setup-v1:old','kind':'entry_setup','text':'Old entry'}
+  current={'id':'combined-entry-v1:new','kind':'combined_entry_setup','text':'Combined entry'}
+  state={'records':{},'pending':[old,current],'delivered':[]}
+  s.migrate_timeframe_alerts(state);s.migrate_timeframe_alerts(state)
+  self.assertEqual(state['pending'],[current]);self.assertEqual(state['superseded_entry_alerts'],[old]);self.assertEqual(state['delivered'],[])
+ def test_nonoverlapping_parent_not_used_and_duplicate_level_is_one_option(self):
+  stock,matched,ref=self.fixture();extra=dict(matched[0][0],date='2026-02-01');stock['zones']=[extra]
+  stock['entry_references'].append(dict(ref,parentDate=extra['date']))
+  text=s.combined_entry_alert(stock,matched)['text'];self.assertNotIn('Alternative:',text)
+  ref['parentD']=200;ref['parentP']=220;matched[0][0].update(d=200,p=220)
+  stock['zones']=[];stock['entry_references']=[ref];self.assertIsNone(s.combined_entry_alert(stock,matched))
 
 if __name__=='__main__':unittest.main()

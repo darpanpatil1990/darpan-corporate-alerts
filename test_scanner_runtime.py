@@ -381,9 +381,9 @@ class EntryReferenceTests(unittest.TestCase):
   script=r"""
 const assert=require('assert'),engine=require('./zone_engine.cjs'),{entryReferences}=require('./zone_runner.cjs');
 const parent={tf:'Monthly',date:'2026-01-01',d:90,p:120,currentInside:true,firstTouch:'2026-09-10',latestTouch:'2026-09-10'};
-const child={tf:'Daily',date:'2026-09-01',departureEnd:'2026-09-02',d:98,p:102,currentInside:true,fresh:true,matches:[],achievement:1};
+const child={tf:'Daily',date:'2026-09-01',departureEnd:'2026-09-02',d:98,p:102,currentInside:true,fresh:true,doubleExciting:true,n:1,matches:[],achievement:1};
 const rows=[['2026-09-10',100,104,99,100],['2026-09-11',100,114,99,112],['2026-09-12',101,103,99,100]];
-const stock={symbol:'TEST',cmp:100,asof:'2026-09-12',zones:[parent,child],curves:{},trends:{Weekly:{state:'Up'}},htfContexts:[{...parent,id:'parent'}]};
+const stock={symbol:'TEST',cmp:100,asof:'2026-09-12',zones:[parent,child,{tf:'Quarterly',date:'2025-01-01',d:90,p:100,fresh:true,departureAchievement:{known:true,strong:true,closeConfirmed:true,grade:3,supplyBreakCount:1}}],curves:{Monthly:{location:'Very Low',demand:parent}},trends:{Weekly:{state:'Up'}},htfContexts:[{...parent,id:'parent'}]};
 const payload={rows,asof:stock.asof};const original=engine.supplies;
 engine.supplies=()=>[];
 assert.equal(entryReferences(stock,payload)[0].status,'WAIT_SUPPLY_CLOSE');
@@ -394,12 +394,33 @@ rows[1][4]=112;rows[1][5]=false;r=entryReferences(stock,payload)[0];assert.equal
 rows[1][5]=true;stock.cmp=103;child.currentInside=false;r=entryReferences(stock,payload)[0];assert.equal(r.status,'WAIT_RETEST');
 engine.supplies=()=>[];
 for(const [tf,trend,entry] of [['Monthly','Weekly','Daily'],['Quarterly','Monthly','Weekly'],['Half Yearly','Quarterly','Monthly'],['Yearly','Half Yearly','Quarterly']]){
- stock.zones=[{...parent,tf}];r=entryReferences(stock,payload)[0];assert.equal(r.trendTF,trend);assert.equal(r.entryTF,entry);assert.equal(r.status,'WAIT_ENTRY_ZONE');assert.equal(r.ready,false);
+ stock.zones=[{...parent,tf}];stock.curves={[tf]:{location:'Very Low',demand:stock.zones[0]}};stock.trends={[trend]:{state:'Up'}};r=entryReferences(stock,payload)[0];assert.equal(r.trendTF,trend);assert.equal(r.entryTF,entry);assert.equal(r.status,'WAIT_ENTRY_ZONE');assert.equal(r.ready,false);
 }
 engine.supplies=original;console.log('Entry reference assertions passed');
 """
   output=subprocess.check_output(['node','-e',script],text=True,cwd=s.ROOT)
   self.assertIn('assertions passed',output)
+ def test_best_level_requires_proximal_achievement_and_top_down_gates(self):
+  import subprocess
+  script=r"""
+const assert=require('assert'),{selectIncomeLevel,entryReferences}=require('./zone_runner.cjs');
+const parent={tf:'Monthly',date:'2026-01-01',d:90,p:110,fresh:true};
+const level=(d,p,extra={})=>({tf:'Daily',date:'2026-09-01',d,p,fresh:true,doubleExciting:true,n:1,achievement:1,...extra});
+const proof={known:true,strong:true,closeConfirmed:true,grade:3,supplyBreakCount:2,through:'2026-08-01'};
+const support={tf:'Quarterly',date:'2025-01-01',d:80,p:115,fresh:true,departureAchievement:proof};
+const best=level(114,116),zones=[parent,support,level(140,145,{achievement:0}),level(125,130),level(120,122),level(118,119),best];
+const stock={symbol:'TEST',cmp:150,asof:'2026-09-12',zones,curves:{Monthly:{location:'Low',demand:parent}},trends:{Weekly:{state:'Up'}}};
+let out=selectIncomeLevel(stock,parent,'Daily');assert.equal(out.levelsChecked,5);assert.equal(out.qualifiedLevels,1);assert.equal(out.best.z.p,116);assert(out.best.z.p>parent.p);
+stock.zones[2].achievement=1;stock.zones.push({...support,tf:'Yearly',p:142,departureAchievement:{...proof,supplyBreakCount:9}});assert.equal(selectIncomeLevel(stock,parent,'Daily').best.z.p,116);stock.zones.pop();stock.zones[2].achievement=0;
+support.p=130;out=selectIncomeLevel(stock,parent,'Daily');assert(!out.best||out.best.z.p!==116); // overlap alone does not qualify selected band
+support.p=115;support.departureAchievement={...proof,strong:false};assert.equal(selectIncomeLevel(stock,parent,'Daily').qualifiedLevels,0);
+support.departureAchievement=proof;
+best.doubleExciting=false;best.n=4;best.closingStrong=true;out=selectIncomeLevel(stock,parent,'Daily');assert.equal(out.best.z.p,116);assert.equal(out.best.quality.best,false);assert.equal(out.qualifiedLevels,1);best.achievement=0;assert.equal(selectIncomeLevel(stock,parent,'Daily').qualifiedLevels,0);best.achievement=1;
+stock.trends.Weekly.state='Down';let r=entryReferences(stock,{asof:stock.asof,rows:[['2026-09-10',150,151,149,150],['2026-09-11',150,151,149,150],['2026-09-12',150,151,149,150]]})[0];assert.equal(r.status,'WAIT_TREND');assert.equal(r.entryReference,undefined);
+stock.trends.Weekly.state='Up';stock.curves.Monthly.location='Middle';r=entryReferences(stock,{asof:stock.asof,rows:[['2026-09-10',150,151,149,150],['2026-09-11',150,151,149,150],['2026-09-12',150,151,149,150]]});assert.equal(r.length,0);
+console.log('Best level gates passed');
+"""
+  self.assertIn('gates passed',subprocess.check_output(['node','-e',script],text=True,cwd=s.ROOT))
  def test_message_labels_levels_as_reference_and_fits_telegram(self):
   fixture=AlertUpgradeTests();stock=fixture.stock();z=fixture.zone()
   ref={'parentTF':'Monthly','parentDate':z['date'],'parentD':z['d'],'parentP':z['p'],'trendTF':'Weekly','trend':'Up','entryTF':'Daily','status':'WAIT_RETEST','zoneDate':'2026-09-01','distal':95,'proximal':105,'entryReference':105,'stopReference':95,'targets':[{'rr':r,'price':105+r*10} for r in (2,3,4)]}

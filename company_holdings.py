@@ -28,18 +28,22 @@ def request(address, payload=None, token=None, method=None):
         headers['Content-Type'] = 'application/json'
     req = urllib.request.Request(address, data=json.dumps(payload).encode() if payload is not None else None,
                                  headers=headers, method=method)
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             with urllib.request.urlopen(req, timeout=20) as response:
                 return response.read().decode('utf-8-sig')
         except urllib.error.HTTPError as error:
             # Retry only transient reads, never writes or Telegram delivery.
-            if payload is not None or attempt or error.code not in (429, 500, 502, 503, 504):
+            if payload is not None or req.get_method() != 'GET' or attempt == 2 or error.code not in (429, 500, 502, 503, 504):
                 raise
             delay = error.headers.get('Retry-After', '8')
             if not delay.isdigit() or int(delay) > 30:
                 raise
             time.sleep(max(1, int(delay)))
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            if payload is not None or req.get_method() != 'GET' or attempt == 2:
+                raise
+            time.sleep(2 ** (attempt + 1))
 
 
 def read_company(symbol):
@@ -193,7 +197,7 @@ class Store:
 
 def main():
     dry_run = '--dry-run' in __import__('sys').argv
-    symbols = universe_from_csv(request(UNIVERSE_URL))
+    symbols = [s for s in universe_from_csv(request(UNIVERSE_URL)) if not s.startswith('DUMMY')]
     limit = min(50, max(1, int(os.environ.get('HOLDINGS_BATCH_SIZE', '25'))))
     if dry_run:
         state = {'cursor': 0, 'records': {}, 'pending': [], 'delivered': []}
@@ -271,3 +275,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

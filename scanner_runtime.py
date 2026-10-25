@@ -465,7 +465,7 @@ def entry_reference_text(stock,tf,group):
     zones={(z['date'],z['d'],z['p']) for z,_ in group}
     refs=[r for r in stock.get('entry_references',[]) if r['parentTF']==tf and (r['parentDate'],r['parentD'],r['parentP']) in zones]
     if not refs:return 'Entry review: no verified lower-timeframe reference available. Entry Ready is not enabled.'
-    statuses={'WAIT_HTF_LOCATION':'Waiting for parent Low / Very Low curve location','WAIT_TREND':'Waiting for required higher-timeframe Up trend','WAIT_ACHIEVEMENT_LEVEL':'Waiting for HTF achievement proximal inside an entry level','WAIT_ENTRY_ACHIEVEMENT':'HTF support found; entry-zone achievement missing / unknown','WAIT_ENTRY_ZONE':'Waiting for a qualified nested entry zone','WAIT_SUPPLY_CLOSE':'Waiting for completed supply close above distal','WAIT_RETEST':'Waiting for demand retest / price at entry zone','REVIEW_REQUIRED':'Automated observations present; analyst review required'}
+    statuses={'WAIT_HTF_LOCATION':'Waiting for parent Low / Very Low curve location','WAIT_TREND':'Waiting for required higher-timeframe Up trend','WAIT_ACHIEVEMENT_LEVEL':'Waiting for HTF support proximal inside an entry level','WAIT_ENTRY_ACHIEVEMENT':'HTF support found; entry-zone achievement missing / unknown','WAIT_ENTRY_ZONE':'Waiting for a qualified entry zone','WAIT_SUPPLY_CLOSE':'Waiting for completed supply close above distal','WAIT_RETEST':'Waiting for demand retest / price at entry zone','REVIEW_REQUIRED':'Automated observations present; analyst review required'}
     lines=['Entry references only | NOT Entry Ready']
     for r in sorted(refs,key=lambda r:('entryReference' not in r, r.get('parentDate','')),reverse=False)[:2]:
         lines.append(r['trendTF']+' trend: '+r['trend']+' (chart review needed) | '+r['entryTF']+' entry')
@@ -484,11 +484,38 @@ def entry_reference_text(stock,tf,group):
 
 def timeframe_alert(stock,tf,group,all_matches):
     others=[TIMEFRAME_CODES[k] for k in timeframe_groups(all_matches) if k!=tf]
-    reference=entry_reference_text(stock,tf,group)
-    text=alert_text(stock,group,budget=max(1600,3850-len(reference)))+'\n\n'+reference
+    text=alert_text(stock,group,budget=3700)
+    text+='\n\nOpportunity alert: lower-timeframe entry conditions are assessed separately; this is not Entry Ready.'
     if others:text+='\nAlso matching: '+', '.join(others)+' (separate alerts).'
     return {'id':match_identity(stock['symbol'],group),'kind':'timeframe_match','timeframe':tf,
             'text':TIMEFRAME_CODES[tf]+' | '+tf+' Demand\n'+text,'watches':alert_watches(stock,group)}
+
+def entry_setup_alerts(stock,tf,group):
+    """A distinct, deduplicated follow-up; never gate the original evidence match."""
+    zones={(z['date'],z['d'],z['p']):(z,items) for z,items in group}
+    mapping={'Monthly':('Weekly','Daily'),'Quarterly':('Monthly','Weekly'),'Half Yearly':('Quarterly','Monthly'),'Yearly':('Half Yearly','Quarterly')}
+    for ref in stock.get('entry_references',[]):
+        if ref.get('parentTF')!=tf:continue
+        pair=zones.get((ref.get('parentDate'),ref.get('parentD'),ref.get('parentP')))
+        if not pair:continue
+        z,items=pair
+        if ref.get('status') not in ('WAIT_SUPPLY_CLOSE','WAIT_RETEST','REVIEW_REQUIRED'):continue
+        if ref.get('location') not in ('Low','Very Low') or ref.get('trend')!='Up':continue
+        if (ref.get('trendTF'),ref.get('entryTF'))!=mapping[tf]:continue
+        d,p=ref.get('distal'),ref.get('proximal')
+        if not all(isinstance(v,(int,float)) and math.isfinite(v) for v in (d,p)) or not 0<d<p:continue
+        achievement=ref.get('achievement')
+        if not isinstance(achievement,(int,float)) or not math.isfinite(achievement) or achievement<1:continue
+        if not ref.get('zoneDate') or ref.get('entryReference')!=p or ref.get('stopReference')!=d:continue
+        if not any(isinstance(k.get('proximal'),(int,float)) and d<=k['proximal']<=p for k in ref.get('achievementKeypoints',[])):continue
+        quality=stock['quality']
+        # No quote, proof count, score or target rounding in notification identity.
+        key=[stock['symbol'],quality.get('stock_isin'),quality.get('exchange','NSE'),tf,z['date'],z['d'],z['p'],z.get('latestTouch') or z.get('firstTouch'),ref['entryTF'],ref['zoneDate'],d,p,ref['status']]
+        identity='entry-setup-v1:'+hashlib.sha256(json.dumps(key,sort_keys=True).encode()).hexdigest()
+        selected=dict(stock,entry_references=[ref]);reference=entry_reference_text(selected,tf,[(z,items)])
+        text=TIMEFRAME_CODES[tf]+' | Entry setup follow-up | '+stock['symbol']+'\n'+reference+'\n\n'+alert_text(stock,[(z,items)],budget=max(1000,3900-len(reference)))
+        if len(text)>4096:raise ValueError('Entry setup message exceeds Telegram limit')
+        yield {'id':identity,'kind':'entry_setup','timeframe':tf,'text':text,'watches':alert_watches(stock,[(z,items)])}
 
 def migrate_timeframe_alerts(state):
     """Preserve delivered combined history; split only reconstructable unsent alerts."""
@@ -504,7 +531,7 @@ def migrate_timeframe_alerts(state):
                 if identity not in delivered:state['delivered'].append(identity);delivered.add(identity)
     pending=[];seen=set(delivered)
     for item in state['pending']:
-        if item.get('kind') in ('timeframe_match','zone_break'):parts=[item]
+        if item.get('kind') in ('timeframe_match','entry_setup','zone_break'):parts=[item]
         elif item['id'] in replacements:parts=replacements[item['id']]
         elif item['id'] in delivered:continue
         else:
@@ -525,6 +552,9 @@ def queue_timeframe_alerts(state,stock,matched,previous,queued,delivered):
             state['delivered'].append(identity);delivered.add(identity)
         if identity not in queued and identity not in delivered:
             state['pending'].append(timeframe_alert(stock,tf,group,matched));queued.add(identity)
+        for item in entry_setup_alerts(stock,tf,group):
+            if item['id'] not in queued and item['id'] not in delivered:
+                state['pending'].append(item);queued.add(item['id'])
 
 def watch_identity(symbol,isin,exchange,z):
     return 'zone-watch:'+hashlib.sha256(json.dumps([symbol,isin,exchange,z['tf'],z['date'],z['d'],z['p']],sort_keys=True).encode()).hexdigest()

@@ -476,7 +476,7 @@ def entry_reference_text(stock,tf,group):
             lines.append('Quality: '+r.get('quality','Review needed')+' | Closing: '+r.get('closing','Review needed')+' | achievement '+str(r.get('achievement','unknown')))
             lines.append(f"Unbuffered entry boundary INR {r['entryReference']:.2f} | SL boundary INR {r['stopReference']:.2f}")
             lines.append('Reference targets: '+ ' | '.join(f"1:{t['rr']} {t['price']:.2f}" for t in r['targets']))
-            for keypoint in r.get('achievementKeypoints',[])[:2]:lines.append(f"HTF achievement: {keypoint['tf']} proximal {keypoint['proximal']:.2f} inside entry range | formed {keypoint['date']}")
+            for keypoint in r.get('achievementKeypoints',[])[:2]:lines.append(f"HTF support: {keypoint['tf']} proximal {keypoint['proximal']:.2f} inside entry range | formed {keypoint['date']}")
             if r.get('supplyClose'):lines.append('Completed supply close observed '+r['supplyClose']['date'][:10])
             if r.get('retestDate'):lines.append('Retest observed '+r['retestDate'][:10])
     lines.append('Buffers, risk sizing, proper-fall / marking and achievement review pending. Targets exclude costs and slippage.')

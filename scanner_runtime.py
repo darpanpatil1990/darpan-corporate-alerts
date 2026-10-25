@@ -465,15 +465,18 @@ def entry_reference_text(stock,tf,group):
     zones={(z['date'],z['d'],z['p']) for z,_ in group}
     refs=[r for r in stock.get('entry_references',[]) if r['parentTF']==tf and (r['parentDate'],r['parentD'],r['parentP']) in zones]
     if not refs:return 'Entry review: no verified lower-timeframe reference available. Entry Ready is not enabled.'
-    statuses={'WAIT_ENTRY_ZONE':'Waiting for a qualified nested entry zone','WAIT_SUPPLY_CLOSE':'Waiting for completed supply close above distal','WAIT_RETEST':'Waiting for demand retest / price at entry zone','REVIEW_REQUIRED':'Automated observations present; analyst review required'}
+    statuses={'WAIT_HTF_LOCATION':'Waiting for parent Low / Very Low curve location','WAIT_TREND':'Waiting for required higher-timeframe Up trend','WAIT_ACHIEVEMENT_LEVEL':'Waiting for HTF achievement proximal inside an entry level','WAIT_ENTRY_ACHIEVEMENT':'HTF support found; entry-zone achievement missing / unknown','WAIT_ENTRY_ZONE':'Waiting for a qualified nested entry zone','WAIT_SUPPLY_CLOSE':'Waiting for completed supply close above distal','WAIT_RETEST':'Waiting for demand retest / price at entry zone','REVIEW_REQUIRED':'Automated observations present; analyst review required'}
     lines=['Entry references only | NOT Entry Ready']
     for r in sorted(refs,key=lambda r:('entryReference' not in r, r.get('parentDate','')),reverse=False)[:2]:
         lines.append(r['trendTF']+' trend: '+r['trend']+' (chart review needed) | '+r['entryTF']+' entry')
         lines.append(statuses[r['status']])
+        lines.append('Curve: '+r.get('location','Unknown')+' | levels checked '+str(r.get('levelsChecked',0))+' | qualified '+str(r.get('qualifiedLevels',0)))
         if 'entryReference' in r:
             lines.append(f"{r['entryTF']} demand {r['distal']:.2f}–{r['proximal']:.2f} | formed {r['zoneDate']}")
+            lines.append('Quality: '+r.get('quality','Review needed')+' | Closing: '+r.get('closing','Review needed')+' | achievement '+str(r.get('achievement','unknown')))
             lines.append(f"Unbuffered entry boundary INR {r['entryReference']:.2f} | SL boundary INR {r['stopReference']:.2f}")
             lines.append('Reference targets: '+ ' | '.join(f"1:{t['rr']} {t['price']:.2f}" for t in r['targets']))
+            for keypoint in r.get('achievementKeypoints',[])[:2]:lines.append(f"HTF achievement: {keypoint['tf']} proximal {keypoint['proximal']:.2f} inside entry range | formed {keypoint['date']}")
             if r.get('supplyClose'):lines.append('Completed supply close observed '+r['supplyClose']['date'][:10])
             if r.get('retestDate'):lines.append('Retest observed '+r['retestDate'][:10])
     lines.append('Buffers, risk sizing, proper-fall / marking and achievement review pending. Targets exclude costs and slippage.')

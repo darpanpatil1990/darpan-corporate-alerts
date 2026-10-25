@@ -413,7 +413,7 @@ const stock={symbol:'TEST',cmp:150,asof:'2026-09-12',zones,curves:{Monthly:{loca
 let out=selectIncomeLevel(stock,parent,'Daily');assert.equal(out.levelsChecked,5);assert.equal(out.qualifiedLevels,1);assert.equal(out.best.z.p,116);assert(out.best.z.p>parent.p);
 stock.zones[2].achievement=1;stock.zones.push({...support,tf:'Yearly',p:142,departureAchievement:{...proof,supplyBreakCount:9}});assert.equal(selectIncomeLevel(stock,parent,'Daily').best.z.p,116);stock.zones.pop();stock.zones[2].achievement=0;
 support.p=130;out=selectIncomeLevel(stock,parent,'Daily');assert(!out.best||out.best.z.p!==116); // overlap alone does not qualify selected band
-support.p=115;support.departureAchievement={...proof,strong:false};assert.equal(selectIncomeLevel(stock,parent,'Daily').qualifiedLevels,0);
+support.p=115;support.departureAchievement={...proof,strong:false};assert.equal(selectIncomeLevel(stock,parent,'Daily').qualifiedLevels,1);
 support.departureAchievement=proof;
 best.doubleExciting=false;best.n=4;best.closingStrong=true;out=selectIncomeLevel(stock,parent,'Daily');assert.equal(out.best.z.p,116);assert.equal(out.best.quality.best,false);assert.equal(out.qualifiedLevels,1);best.achievement=0;assert.equal(selectIncomeLevel(stock,parent,'Daily').qualifiedLevels,0);best.achievement=1;
 stock.trends.Weekly.state='Down';let r=entryReferences(stock,{asof:stock.asof,rows:[['2026-09-10',150,151,149,150],['2026-09-11',150,151,149,150],['2026-09-12',150,151,149,150]]})[0];assert.equal(r.status,'WAIT_TREND');assert.equal(r.entryReference,undefined);

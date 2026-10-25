@@ -515,7 +515,55 @@ def entry_setup_alerts(stock,tf,group):
         selected=dict(stock,entry_references=[ref]);reference=entry_reference_text(selected,tf,[(z,items)])
         text=TIMEFRAME_CODES[tf]+' | Entry setup follow-up | '+stock['symbol']+'\n'+reference+'\n\n'+alert_text(stock,[(z,items)],budget=max(1000,3900-len(reference)))
         if len(text)>4096:raise ValueError('Entry setup message exceeds Telegram limit')
-        yield {'id':identity,'kind':'entry_setup','timeframe':tf,'text':text,'watches':alert_watches(stock,[(z,items)])}
+        yield {'id':identity,'kind':'entry_setup','timeframe':tf,'text':text,'watches':alert_watches(stock,[(z,items)]),'reference':ref,'parent':z}
+
+def combined_entry_alert(stock,matched):
+    """Compare independently qualified paths; evidence remains tied to its own parent."""
+    if not matched or not stock['quality'].get('current_alerts_eligible',True):return None
+    key=lambda z:(z['tf'],z['date'],z['d'],z['p'])
+    proof={key(z):items for z,items in matched}
+    contexts={}
+    for z in stock.get('zones',[])+[z for z,_ in matched]:
+        if z.get('tf') not in TIMEFRAME_CODES or z.get('broken') or z.get('freshnessUnspecified'):continue
+        d,p=z.get('d'),z.get('p')
+        if not all(isinstance(v,(int,float)) and math.isfinite(v) for v in (d,p)) or not 0<d<p:continue
+        if not d<=stock['cmp']<=p:continue
+        contexts[key(z)]=z
+    groups=timeframe_groups([(z,proof.get(k,[])) for k,z in contexts.items()])
+    candidates=[item for tf,group in groups.items() for item in entry_setup_alerts(stock,tf,group)]
+    if not candidates:return None
+    def rank(item):
+        r,z=item['reference'],item['parent'];width=r['proximal']-r['distal']
+        supports={k['tf'] for k in r['achievementKeypoints'] if k.get('tf') in TIMEFRAME_CODES and r['distal']<=k['proximal']<=r['proximal']}
+        distance=max(0,r['distal']-z['p'],z['d']-r['proximal'])/(z['p']-z['d'])
+        return (-len(supports),-r['achievement'],0 if r.get('closing')=='Strong' else 1,distance,width/r['proximal'],list(TIMEFRAME_CODES).index(z['tf']),r['zoneDate'],z['date'])
+    candidates.sort(key=rank)
+    # The same physical entry level reached through several parent formations is one option.
+    options=[];seen=set()
+    for item in candidates:
+        r=item['reference'];level=(r['entryTF'],r['zoneDate'],r['distal'],r['proximal'])
+        if level not in seen:options.append(item);seen.add(level)
+    best=options[0];r=best['reference'];parent=best['parent'];tf=parent['tf']
+    parents=[z for group in groups.values() for z,_ in group]
+    parent_keys=sorted([z['tf'],z['date'],z['d'],z['p'],z.get('latestTouch') or z.get('firstTouch') or ''] for z in parents)
+    quality=stock['quality']
+    identity='combined-entry-v1:'+hashlib.sha256(json.dumps([stock['symbol'],quality.get('stock_isin'),quality.get('exchange','NSE'),parent_keys,tf,parent['date'],r['entryTF'],r['zoneDate'],r['distal'],r['proximal'],r['status']],sort_keys=True).encode()).hexdigest()
+    lines=['Combined Best Entry Setup | '+stock['symbol'],'HTF demand at current price: '+', '.join(TIMEFRAME_CODES[t] for t in groups)]
+    for z in parents[:8]:lines.append(f"{TIMEFRAME_CODES[z['tf']]} {z['d']:.2f}–{z['p']:.2f} | formed {z['date']}")
+    if len(parents)>8:lines.append(str(len(parents)-8)+' additional HTF formations retained in scan state.')
+    if len(groups)>1:lines.append(f"Common demand overlap: {max(z['d'] for z in parents):.2f}–{min(z['p'] for z in parents):.2f}")
+    lines.append('Buying evidence matched to: '+', '.join(TIMEFRAME_CODES[t] for t in timeframe_groups(matched))+'. Other HTF bands are price support, not separate buying proof.')
+    lines.append('Best qualified path: '+tf+' demand → '+r['trendTF']+' Up → '+r['entryTF']+' entry')
+    lines.append('Selection: HTF proximal-support count, entry achievement, closing, then relative distance and width. Seven-star is optional; ranking does not predict returns.')
+    lines.append(entry_reference_text(dict(stock,entry_references=[r]),tf,[(parent,proof.get(key(parent),[]))]))
+    for item in options[1:4]:
+        alt=item['reference']
+        lines.append(f"Alternative: {alt['parentTF']} → {alt['trendTF']} Up → {alt['entryTF']} demand {alt['distal']:.2f}–{alt['proximal']:.2f} | achievement {alt['achievement']} | {alt['status']}")
+    lines.append('Each path passed its own curve, trend, HTF support and entry-achievement gates. No conditions borrowed from another path.')
+    prefix='\n'.join(lines)+'\n\n'
+    text=prefix+alert_text(stock,matched,budget=max(800,4000-len(prefix)),include_zones=False)
+    if len(text)>4096:raise ValueError('Combined entry message exceeds Telegram limit')
+    return {'id':identity,'kind':'combined_entry_setup','text':text,'watches':alert_watches(stock,[(z,[]) for z in parents])}
 
 def migrate_timeframe_alerts(state):
     """Preserve delivered combined history; split only reconstructable unsent alerts."""
@@ -531,7 +579,11 @@ def migrate_timeframe_alerts(state):
                 if identity not in delivered:state['delivered'].append(identity);delivered.add(identity)
     pending=[];seen=set(delivered)
     for item in state['pending']:
-        if item.get('kind') in ('timeframe_match','entry_setup','zone_break'):parts=[item]
+        if item.get('kind')=='entry_setup':
+            superseded=state.setdefault('superseded_entry_alerts',[])
+            if not any(old['id']==item['id'] for old in superseded):superseded.append(item)
+            continue
+        if item.get('kind') in ('timeframe_match','combined_entry_setup','zone_break'):parts=[item]
         elif item['id'] in replacements:parts=replacements[item['id']]
         elif item['id'] in delivered:continue
         else:
@@ -552,9 +604,9 @@ def queue_timeframe_alerts(state,stock,matched,previous,queued,delivered):
             state['delivered'].append(identity);delivered.add(identity)
         if identity not in queued and identity not in delivered:
             state['pending'].append(timeframe_alert(stock,tf,group,matched));queued.add(identity)
-        for item in entry_setup_alerts(stock,tf,group):
-            if item['id'] not in queued and item['id'] not in delivered:
-                state['pending'].append(item);queued.add(item['id'])
+    item=combined_entry_alert(stock,matched)
+    if item and item['id'] not in queued and item['id'] not in delivered:
+        state['pending'].append(item);queued.add(item['id'])
 
 def watch_identity(symbol,isin,exchange,z):
     return 'zone-watch:'+hashlib.sha256(json.dumps([symbol,isin,exchange,z['tf'],z['date'],z['d'],z['p']],sort_keys=True).encode()).hexdigest()
@@ -603,7 +655,7 @@ def display_evidence(items):
             if not groups[kind]:del groups[kind]
     return result
 
-def alert_text(stock,matched,budget=3950):
+def alert_text(stock,matched,budget=3950,include_zones=True):
     quote=stock['quality']['quote'];lines=['Institutional evidence + HTF demand',stock['symbol']+' | '+quote['kind']+' INR '+str(round(stock['cmp'],2)), 'Price as of '+quote['asof']+' | Exchange '+stock['quality'].get('exchange','NSE')]
     membership=stock.get('universe_membership',{})
     if membership.get('current_source_verified') is False:lines.append('Index membership last verified '+membership['verified_at']+'; current membership source unavailable.')
@@ -612,7 +664,7 @@ def alert_text(stock,matched,budget=3950):
     buyers={}
     for z,items in matched:
         position=100*(stock['cmp']-z['d'])/(z['p']-z['d']) if z['p']>z['d'] else 0
-        lines.append(f"{z['tf']} demand {z['d']:.2f}–{z['p']:.2f} | formed {z['date']} | {'First return' if z['firstReturn'] else 'Tested context'} | visits {z.get('testEpisodes','unknown')} | position {position:.0f}% from distal | visit {z.get('latestTouch')}")
+        if include_zones:lines.append(f"{z['tf']} demand {z['d']:.2f}–{z['p']:.2f} | formed {z['date']} | {'First return' if z['firstReturn'] else 'Tested context'} | visits {z.get('testEpisodes','unknown')} | position {position:.0f}% from distal | visit {z.get('latestTouch')}")
         for item in items:buyers[evidence_identity(item)]=item
     footer='Monthly MF holding changes are not confirmed same-day buys. Splits and other non-trade changes may affect holdings.\nDemand Lab v31 OHLC bands. Research match; entry confirmation required. Public quotes may be delayed.'
     shown=0

@@ -375,4 +375,38 @@ class TimeframeAlertTests(unittest.TestCase):
   s.queue_timeframe_alerts(state,self.stock(),current,previous,set(),{identity})
   self.assertEqual([item['timeframe'] for item in state['pending']],['Quarterly','Half Yearly','Yearly'])
 
+class EntryReferenceTests(unittest.TestCase):
+ def test_reference_mapping_closed_candles_and_never_ready(self):
+  import subprocess
+  script=r"""
+const assert=require('assert'),engine=require('./zone_engine.cjs'),{entryReferences}=require('./zone_runner.cjs');
+const parent={tf:'Monthly',date:'2026-01-01',d:90,p:120,currentInside:true,firstTouch:'2026-09-10',latestTouch:'2026-09-10'};
+const child={tf:'Daily',date:'2026-09-01',departureEnd:'2026-09-02',d:98,p:102,currentInside:true,fresh:true,matches:[],achievement:1};
+const rows=[['2026-09-10',100,104,99,100],['2026-09-11',100,114,99,112],['2026-09-12',101,103,99,100]];
+const stock={symbol:'TEST',cmp:100,asof:'2026-09-12',zones:[parent,child],curves:{},trends:{Weekly:{state:'Up'}},htfContexts:[{...parent,id:'parent'}]};
+const payload={rows,asof:stock.asof};const original=engine.supplies;
+engine.supplies=()=>[];
+assert.equal(entryReferences(stock,payload)[0].status,'WAIT_SUPPLY_CLOSE');
+engine.supplies=()=>[{date:'2026-09-01',p:103,d:105,bodyIn:.8,bodyOut:.8}];
+let r=entryReferences(stock,payload)[0];assert.equal(r.status,'REVIEW_REQUIRED');assert.equal(r.ready,false);assert.equal(r.entryReference,102);assert.equal(r.stopReference,98);assert.deepEqual(r.targets.map(t=>t.price),[110,114,118]);
+rows[1][4]=104;r=entryReferences(stock,payload)[0];assert.equal(r.status,'WAIT_SUPPLY_CLOSE');
+rows[1][4]=112;rows[1][5]=false;r=entryReferences(stock,payload)[0];assert.equal(r.status,'WAIT_SUPPLY_CLOSE');
+rows[1][5]=true;stock.cmp=103;child.currentInside=false;r=entryReferences(stock,payload)[0];assert.equal(r.status,'WAIT_RETEST');
+engine.supplies=()=>[];
+for(const [tf,trend,entry] of [['Monthly','Weekly','Daily'],['Quarterly','Monthly','Weekly'],['Half Yearly','Quarterly','Monthly'],['Yearly','Half Yearly','Quarterly']]){
+ stock.zones=[{...parent,tf}];r=entryReferences(stock,payload)[0];assert.equal(r.trendTF,trend);assert.equal(r.entryTF,entry);assert.equal(r.status,'WAIT_ENTRY_ZONE');assert.equal(r.ready,false);
+}
+engine.supplies=original;console.log('Entry reference assertions passed');
+"""
+  output=subprocess.check_output(['node','-e',script],text=True,cwd=s.ROOT)
+  self.assertIn('assertions passed',output)
+ def test_message_labels_levels_as_reference_and_fits_telegram(self):
+  fixture=AlertUpgradeTests();stock=fixture.stock();z=fixture.zone()
+  ref={'parentTF':'Monthly','parentDate':z['date'],'parentD':z['d'],'parentP':z['p'],'trendTF':'Weekly','trend':'Up','entryTF':'Daily','status':'WAIT_RETEST','zoneDate':'2026-09-01','distal':95,'proximal':105,'entryReference':105,'stopReference':95,'targets':[{'rr':r,'price':105+r*10} for r in (2,3,4)]}
+  stock['entry_references']=[ref];items=[dict(fixture.evidence(),buyer='Fund '+str(i)+'x'*170) for i in range(30)]
+  msg=s.timeframe_alert(stock,'Monthly',[(z,items)],[(z,items)])
+  self.assertIn('NOT Entry Ready',msg['text']);self.assertIn('SL boundary INR 95.00',msg['text']);self.assertIn('1:2 125.00',msg['text']);self.assertIn('Buffers, risk sizing',msg['text']);self.assertLessEqual(len(msg['text']),4096)
+  other=s.entry_reference_text(stock,'Quarterly',[(dict(z,tf='Quarterly'),items)])
+  self.assertNotIn('105.00',other)
+
 if __name__=='__main__':unittest.main()

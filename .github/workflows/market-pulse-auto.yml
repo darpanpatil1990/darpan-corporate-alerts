@@ -19,7 +19,10 @@ jobs:
   monitor:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    if: github.ref_name == github.event.repository.default_branch && (github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == github.event.repository.default_branch && github.event.workflow_run.head_repository.full_name == github.repository))
+    if: github.ref_name == github.event.repository.default_branch && (github.event_name != 'workflow_run'
+      || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch ==
+      github.event.repository.default_branch && github.event.workflow_run.head_repository.full_name ==
+      github.repository))
     steps:
     - name: Install HTML reader
       run: python -m pip install --quiet beautifulsoup4==4.14.3
@@ -31,6 +34,247 @@ jobs:
         CHAT_ID: ${{ secrets.CHAT_ID }}
         GH_TOKEN: ${{ github.token }}
       shell: python
-      run: "\"\"\"Monitor readable Market Pulse rows without interpreting or inventing metrics.\"\"\"\nimport base64\nimport hashlib\nimport http.cookiejar\nimport json\nimport os\nimport re\nimport time\nimport urllib.error\nimport urllib.parse as url\nimport urllib.request as web\nfrom datetime import datetime\nfrom decimal import Decimal, InvalidOperation\nfrom zoneinfo import ZoneInfo\nfrom bs4 import BeautifulSoup\n\nBASE = 'https://www.screener.in'\nSTATE_PATH = 'market-pulse-state.json'\nMAX_PAGES = 2\nMAX_SEND = 30\nFII_SOURCE = 'https://www.nseindia.com/reports/fii-dii'\nFII_API = 'https://www.nseindia.com/api/fiidiiTradeReact'\nSOURCES = [\n    ('Bulk Deals', '/trades/bulk/?o=-2'),\n    ('Block Deals', '/trades/block/?o=-2'),\n    ('SAST Trades', '/trades/sast/?o=-2'),\n    ('Insider Trades', '/trades/insiders/?o=-2'),\n    ('Bonus', '/actions/bonus/?o=-1'),\n    ('Rights', '/actions/right/?o=-1'),\n    ('Split', '/actions/split/?o=-1'),\n    ('Buyback', '/actions/buyback/?o=-1'),\n    ('Dividend', '/actions/dividend/?o=-1'),\n    ('Concalls', '/concalls/'),\n    ('Upcoming Concalls', '/concalls/upcoming/'),\n    ('Annual Reports', '/annual-reports/'),\n    ('Upcoming Results', '/upcoming-results/'),\n]\n\n\ndef digest(value):\n    return hashlib.sha256(value.encode()).hexdigest()\n\n\ndef safe_link(value):\n    target = url.urljoin(BASE, value)\n    p = url.urlparse(target)\n    host = (p.hostname or '').lower()\n    if p.scheme == 'https' and not p.username and not p.password and any(\n            host == d or host.endswith('.' + d)\n            for d in ('screener.in', 'bseindia.com', 'nseindia.com')):\n        return target\n    return None\n\n\ndef parse_items(page, name, source):\n    soup = BeautifulSoup(page, 'html.parser')\n    main = soup.find('main') or soup\n    title = main.find('h1')\n    if not title:\n        raise RuntimeError('Section heading missing')\n    table = main.select_one('table#result_list')\n    if table is None:\n        tables = main.select('table')\n        if len(tables) == 1:\n            table = tables[0]\n    items = []\n    if table is not None:\n        head_rows = table.select('thead tr')\n        if len(head_rows) != 1:\n            raise RuntimeError('Multi-level or missing table header; layout review required')\n        heads = head_rows[0].find_all(['th', 'td'], recursive=False)\n        if any(int(c.get('colspan', 1)) != 1 or int(c.get('rowspan', 1)) != 1 for c in heads):\n            raise RuntimeError('Merged header cells; layout review required')\n        headers = [h.get_text(' ', strip=True) for h in heads]\n        if len(headers) < 2 or any(not h for h in headers):\n            raise RuntimeError('Incomplete table labels')\n        for row in table.select('tbody tr'):\n            cells = row.find_all(['th', 'td'], recursive=False)\n            if len(cells) == 1 and int(cells[0].get('colspan', 1)) > 1:\n                if re.search(r'no (results|records)', cells[0].get_text(' ', strip=True), re.I):\n                    continue\n            if len(cells) != len(headers) or any(int(c.get('colspan', 1)) != 1 or int(c.get('rowspan', 1)) != 1 for c in cells):\n                raise RuntimeError('Table labels do not match values')\n            values = [c.get_text(' ', strip=True) for c in cells]\n            if not any(values):\n                continue\n            if any(len(v) > 500 for v in values):\n                raise RuntimeError('Unexpectedly long table value')\n            links = list(dict.fromkeys(filter(None, (safe_link(a['href']) for a in row.select('a[href]')))))\n            lines = [f'{h}: {v or \"Not provided\"}' for h, v in zip(headers, values)]\n            identity = digest(name + '|' + json.dumps(list(zip(headers, values)), ensure_ascii=False))\n            text = name + '\\n\\n' + '\\n'.join(lines)\n            text += '\\n\\nSource: Screener\\n' + source\n            if links:\n                text += '\\nRelated link: ' + links[0]\n            if len(text) > 3900:\n                raise RuntimeError('Record exceeds Telegram message limit')\n            items.append({'id': identity, 'section': name, 'text': text})\n    elif name == 'Annual Reports':\n        for a in main.select('a[href]'):\n            target = safe_link(a['href'])\n            if not target or not ('.pdf' in target.lower() or 'downloadattach' in target.lower()):\n                continue\n            label = a.get_text(' ', strip=True)\n            company = ''\n            for parent in a.parents:\n                if parent.name in ('main', 'body', 'html'):\n                    break\n                companies = parent.select('a[href*=\"/company/\"]')\n                if len(companies) > 1:\n                    break\n                if len(companies) == 1:\n                    company = companies[0].get_text(' ', strip=True)\n                    break\n            text = 'Annual Reports\\n\\n' + (company + '\\n' if company else '')\n            text += (label[:500] or 'Annual report document')\n            text += '\\n\\nDocument: ' + target + '\\nSource: Screener\\n' + source\n            items.append({'id': digest(name + '|' + target), 'section': name, 'text': text})\n        if not items:\n            raise RuntimeError('Annual report document layout not recognised')\n    else:\n        raise RuntimeError('Expected table not found')\n    return list({item['id']: item for item in items}.values())\n\n\ndef following_page(page, current):\n    soup = BeautifulSoup(page, 'html.parser')\n    parsed = url.urlparse(current)\n    candidates = []\n    for a in soup.select('a[href]'):\n        label = a.get_text(' ', strip=True).lower()\n        if 'next' in a.get('rel', []) or re.fullmatch(r'next\\s*[→»›]?', label):\n            candidates.append(a['href'])\n    # Django list pages expose numbered links without a Next button.\n    current_number = 1\n    for selected in soup.select('.paginator .this-page, .pagination .current'):\n        if selected.get_text(strip=True).isdigit():\n            current_number = int(selected.get_text(strip=True))\n    for a in soup.select('.paginator a[href], .pagination a[href]'):\n        if a.get_text(strip=True) == str(current_number + 1):\n            candidates.append(a['href'])\n    for href in candidates:\n        target = url.urljoin(current, href)\n        p = url.urlparse(target)\n        if p.scheme == 'https' and p.hostname == parsed.hostname and p.path == parsed.path and target != current:\n            return target\n    return None\n\n\ndef fii_item(data):\n    \"\"\"Require dated, internally consistent cash-market figures from NSE.\"\"\"\n    if not isinstance(data, list):\n        raise RuntimeError('NSE institutional data is not a list')\n    rows = {r.get('category'): r for r in data if isinstance(r, dict)}\n    if not {'FII/FPI', 'DII'}.issubset(rows):\n        raise RuntimeError('NSE FII/FPI or DII row missing')\n    selected = [rows['FII/FPI'], rows['DII']]\n    if selected[0].get('date') != selected[1].get('date'):\n        raise RuntimeError('NSE institutional dates do not match')\n    date_label = selected[0].get('date', '')\n    try:\n        day = datetime.strptime(date_label, '%d-%b-%Y').date()\n    except ValueError:\n        raise RuntimeError('NSE institutional date format not recognised') from None\n    age = (datetime.now(ZoneInfo('Asia/Kolkata')).date() - day).days\n    if not 0 <= age <= 10:\n        raise RuntimeError('NSE institutional data is stale or future dated')\n    lines = ['FII/FPI & DII cash-market activity', 'Trade date: ' + date_label,\n             'Amounts: INR crore | Provisional data']\n    normalised = []\n    for row in selected:\n        try:\n            buy, sell, net = [Decimal(str(row[k]).replace(',', ''))\n                              for k in ('buyValue', 'sellValue', 'netValue')]\n        except (InvalidOperation, KeyError):\n            raise RuntimeError('NSE institutional numeric field invalid') from None\n        if not all(n.is_finite() for n in (buy, sell, net)) or buy < 0 or sell < 0 or abs(buy - sell - net) > Decimal('0.05'):\n            raise RuntimeError('NSE institutional totals do not reconcile')\n        lines.extend(['', row['category'], f'Buy: {buy:,.2f}', f'Sell: {sell:,.2f}', f'Net: {net:+,.2f}'])\n        normalised.append([row['category'], str(buy.normalize()), str(sell.normalize()), str(net.normalize())])\n    lines.extend(['', 'Daily market totals; these do not identify purchases in individual stocks.',\n                  'Revised source figures may generate a further alert.', 'Source: NSE', FII_SOURCE])\n    return {'id': digest('NSE-FII-DII|' + date_label + '|' + json.dumps(normalised)),\n            'section': 'FII/DII (NSE)', 'text': '\\n'.join(lines)}\n\n\ndef read_fii():\n    # Independent of the signed-in Screener session; no account secrets go to NSE.\n    request = web.Request(FII_API, headers={'User-Agent': 'Mozilla/5.0',\n        'Accept': 'application/json', 'Referer': FII_SOURCE})\n    with web.urlopen(request, timeout=15) as r:\n        return fii_item(json.load(r))\n\n\ndef login():\n    client = web.build_opener(web.HTTPCookieProcessor(http.cookiejar.CookieJar()))\n    client.addheaders = [('User-Agent', 'Mozilla/5.0')]\n    with client.open(BASE + '/login/', timeout=20) as r:\n        csrf = BeautifulSoup(r.read(), 'html.parser').select_one('input[name=\"csrfmiddlewaretoken\"]')\n    if not csrf:\n        raise RuntimeError('Login form token missing')\n    data = url.urlencode({'username': os.environ['SCREENER_EMAIL'].strip(),\n        'password': os.environ['SCREENER_PASSWORD'], 'csrfmiddlewaretoken': csrf['value'],\n        'next': '/announcements/'}).encode()\n    with client.open(web.Request(BASE + '/login/', data=data,\n            headers={'Referer': BASE + '/login/'}), timeout=20) as r:\n        r.read()\n    with client.open(BASE + '/announcements/', timeout=20) as r:\n        if url.urlparse(r.url).path != '/announcements/' or\
-        \ b'Latest Announcements' not in r.read():\n            raise RuntimeError('Screener login not confirmed')\n    return client\n\n\nclass StateStore:\n    def __init__(self):\n        self.branch = os.environ['GITHUB_REF_NAME']\n        self.endpoint = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/contents/' + STATE_PATH\n        self.sha = None\n        self.state = {'version': 1, 'seen': {}, 'pending': [], 'initialized': [], 'setup_sent': False}\n\n    def api(self, target, data=None):\n        req = web.Request(target, data=json.dumps(data).encode() if data is not None else None,\n            headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json',\n                     'Content-Type': 'application/json', 'User-Agent': 'Darpan-Market-Pulse'},\n            method='PUT' if data is not None else 'GET')\n        with web.urlopen(req, timeout=25) as r:\n            return json.load(r)\n\n    def read(self):\n        try:\n            data = self.api(self.endpoint + '?ref=' + url.quote(self.branch, safe=''))\n        except urllib.error.HTTPError as error:\n            if error.code != 404:\n                raise\n            return\n        self.sha = data['sha']\n        state = json.loads(base64.b64decode(data['content']))\n        if state.get('version') != 1 or not isinstance(state.get('seen'), dict) or not isinstance(state.get('pending'), list) or not isinstance(state.get('initialized'), list):\n            raise RuntimeError('Invalid saved state; refusing to reset history')\n        self.state = state\n\n    def save(self):\n        payload = json.dumps(self.state, separators=(',', ':')).encode()\n        if len(payload) > 850000:\n            raise RuntimeError('State size limit reached; queue retained')\n        data = {'message': 'Update Market Pulse delivery state', 'branch': self.branch,\n                'content': base64.b64encode(payload).decode()}\n        if self.sha:\n            data['sha'] = self.sha\n        self.sha = self.api(self.endpoint, data)['content']['sha']\n\n\ndef send(text):\n    payload = json.dumps({'chat_id': os.environ['CHAT_ID'].strip(), 'text': text,\n        'link_preview_options': {'is_disabled': True}}).encode()\n    request = web.Request('https://api.telegram.org/bot' + os.environ['BOT_TOKEN'].strip() + '/sendMessage',\n        data=payload, headers={'Content-Type': 'application/json'})\n    with web.urlopen(request, timeout=25) as r:\n        if not json.load(r).get('ok'):\n            raise RuntimeError('Telegram rejected delivery')\n\n\ndef monitor(client, store):\n    state = store.state\n    now = int(time.time())\n    state['seen'] = {k: v for k, v in state['seen'].items() if now - v < 180 * 86400}\n    sweeps = state.setdefault('sweeps', {})\n    results, failed = [], []\n    deadline = time.monotonic() + 9 * 60\n    for name, path in SOURCES:\n        if time.monotonic() >= deadline:\n            results.append((name, 'Deferred to next run: time budget', 0, 0))\n            continue\n        target, visited, items, capped = BASE + path, set(), [], False\n        try:\n            while target and len(visited) < MAX_PAGES:\n                if target in visited:\n                    raise RuntimeError('Pagination loop detected')\n                visited.add(target)\n                with client.open(target, timeout=15) as r:\n                    if url.urlparse(r.url).path != url.urlparse(path).path:\n                        raise RuntimeError('Section redirected; access not confirmed')\n                    page = r.read().decode()\n                items.extend(parse_items(page, name, BASE + path))\n                target = following_page(page, target)\n                time.sleep(1)\n            head_next = target\n            capped = bool(target)\n            items = list({item['id']: item for item in items}.values())\n            new_count = 0\n            if name not in state['initialized']:\n                state['seen'].update({item['id']: now for item in items})\n                state['initialized'].append(name)\n                status = 'Baseline saved'\n            else:\n                queued = {i['id'] for i in state['pending']}\n                for item in items:\n                    if item['id'] in state['seen']:\n                        state['seen'][item['id']] = now\n                    elif item['id'] not in queued:\n                        state['pending'].append(item)\n                        queued.add(item['id'])\n                        new_count += 1\n                status = 'Checked'\n            # Continue through older pages across runs instead of stopping forever\n            # at page two. The first extended sweep silently seeds older history.\n            sweep = sweeps.setdefault(name, {'next': None, 'baseline': True, 'completed': 0})\n            continuation = sweep.get('next') or head_next\n            sweep_note = ''\n            if continuation and time.monotonic() < deadline:\n                parsed = url.urlparse(continuation)\n                if parsed.scheme != 'https' or parsed.hostname != 'www.screener.in' or parsed.path != url.urlparse(path).path:\n                    raise RuntimeError('Saved pagination URL is invalid')\n                with client.open(continuation, timeout=15) as r:\n                    if url.urlparse(r.url).path != url.urlparse(path).path:\n                        raise RuntimeError('Extended scan access not confirmed')\n                    older_page = r.read().decode()\n                older_items = parse_items(older_page, name, BASE + path)\n                queued = {i['id'] for i in state['pending']}\n                for item in older_items:\n                    if sweep['baseline'] or item['id'] in state['seen']:\n                        state['seen'][item['id']] = now\n                    elif item['id'] not in queued:\n                        state['pending'].append(item)\n                        queued.add(item['id'])\n                        new_count += 1\n                after = following_page(older_page, continuation)\n                if after == continuation:\n                    raise RuntimeError('Extended pagination loop detected')\n                sweep['next'] = after\n                items.extend(older_items)\n                if after is None:\n                    sweep['baseline'] = False\n                    sweep['completed'] += 1\n                    sweep_note = '; full sweep completed'\n                else:\n                    sweep_note = '; older-page scan continues next run'\n                time.sleep(1)\n            elif not continuation:\n                sweep['next'] = None\n                sweep['baseline'] = False\n                sweep['completed'] += 1\n                sweep_note = '; all available pages checked'\n            else:\n                sweep_note = '; extended scan deferred'\n            results.append((name, status + sweep_note, len({i['id'] for i in items}), new_count))\n            store.save()  # Checkpoint the queue and pagination after every section.\n            print(name + ': ' + status + '; records=' + str(len(items)) + '; new=' + str(new_count), flush=True)\n        except Exception as error:\n            failed.append(name)\n            detail = type(error).__name__ + (' HTTP ' + str(error.code) if isinstance(error, urllib.error.HTTPError) else '')\n            if isinstance(error, RuntimeError):\n                detail += ': ' + str(error)\n            print('SECTION FAILED: ' + name + ' - ' + detail, flush=True)\n            results.append((name, detail, 0, 0))\n    # One dated FII/FPI + DII message on first successful access, then only if\n    # the source date or figures change. Failure leaves the other queues intact.\n    try:\n        item = read_fii()\n        queued = {i['id'] for i in state['pending']}\n        new = int(item['id'] not in state['seen'] and item['id'] not in queued)\n        if new:\n            state['pending'].append(item)\n        elif item['id'] in state['seen']:\n            state['seen'][item['id']] = now\n        results.append(('FII/DII (NSE)', 'Dated data verified', 2, new))\n    except Exception as error:\n        failed.append('FII/DII (NSE)')\n        detail = type(error).__name__ + (' HTTP ' + str(error.code) if isinstance(error, urllib.error.HTTPError) else '')\n        if isinstance(error, RuntimeError):\n            detail += ': ' + str(error)\n        results.append(('FII/DII (NSE)', detail, 0, 0))\n        print('FII/DII UNAVAILABLE: ' + detail, flush=True)\n    if not state['initialized']:\n        raise RuntimeError('No section could be read; no messages sent')\n    setup_id = digest('market-pulse-monitor-started-v1')\n    if not state.get('setup_sent') and not any(i['id'] == setup_id for i in state['pending']):\n        state['pending'].insert(0, {'id': setup_id, 'section': 'Setup', 'text':\n            'Market Pulse monitoring started\\n\\nBaseline saved for: ' + ', '.join(state['initialized']) +\n            '\\n\\nExisting history was not broadcast. New or changed records found in monitored pages will be sent.' +\n            '\\nChecks are scheduled about every 30 minutes; GitHub may delay them.' +\n            '\\nThe first two pages are checked each run; older pages are scanned progressively.' +\n            '\\nFII/FPI and DII daily totals use NSE when its dated data is reachable.'})\n    store.save()  # Queue must be durable before Telegram delivery.\n    sent = 0\n    while state['pending'] and sent < MAX_SEND:\n        item = state['pending'][0]\n        send(item['text'])\n        state['seen'][item['id']] = int(time.time())\n        state['pending'].pop(0)\n        if item['id'] == setup_id:\n            state['setup_sent'] = True\n        store.save()\n        sent += 1\n        time.sleep(1.2)\n    print(f'SUCCESS: Sent: {sent} | Waiting: {len(state[\"pending\"])} | Sections failed: {len(failed)}', flush=True)\n\
-        \    if os.environ.get('GITHUB_STEP_SUMMARY'):\n        with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:\n            f.write('# Market Pulse alerts\\n\\n| Section | Status | Read | New |\\n|---|---|---:|---:|\\n')\n            for row in results:\n                f.write('| ' + ' | '.join(map(str, row)) + ' |\\n')\n            f.write(f'\\nSent: {sent}. Waiting: {len(state[\"pending\"])}.\\n\\n')\n            f.write('First successful check of each section saves history without sending older rows. Later checks send newly observed or changed rows, which may include older dated records newly entering these pages.\\n\\n')\n            f.write('The first two pages are checked each run, plus one older page per section. Older-page scans resume across runs; the first extended sweep seeds older history silently. Later full sweeps look for newly observed or changed records. Fast-moving pagination and source delays can still cause missed records; full real-time coverage is not guaranteed.\\n\\n')\n            f.write('FII/FPI and DII are dated provisional cash-market totals from NSE, not company-specific holdings. Annual reports are document alerts, not report summaries. Existing Corporate Auto Alerts handles announcements and quarterly figures separately.\\n')\n    if failed:\n        raise RuntimeError('Some sections failed; successful sections and pending queue were saved')\n\n\ndef main():\n    try:\n        if not all(os.environ.get(k) for k in ('SCREENER_EMAIL', 'SCREENER_PASSWORD', 'BOT_TOKEN', 'CHAT_ID', 'GH_TOKEN')):\n            raise RuntimeError('Required GitHub secret or token missing')\n        store = StateStore()\n        store.read()\n        monitor(login(), store)\n    except Exception as error:\n        print('FAILED: ' + type(error).__name__, flush=True)\n        if isinstance(error, RuntimeError):\n            print(str(error), flush=True)\n        elif isinstance(error, urllib.error.HTTPError):\n            print('HTTP status: ' + str(error.code), flush=True)\n        raise SystemExit(1)\n\n\nif __name__ == '__main__':\n    main()\n"
+      run: "\"\"\"Monitor readable Market Pulse rows without interpreting or inventing metrics.\"\"\"\n\
+        import base64\nimport hashlib\nimport http.cookiejar\nimport json\nimport os\nimport re\nimport\
+        \ time\nimport urllib.error\nimport urllib.parse as url\nimport urllib.request as web\nfrom datetime\
+        \ import datetime\nfrom decimal import Decimal, InvalidOperation\nfrom zoneinfo import ZoneInfo\n\
+        from bs4 import BeautifulSoup\n\nimport lzma, io\n\n\ndef safe_open(open_fn, target, *args, **kwargs):\n\
+        \    \"\"\"Retry transient reads; never replay an ambiguous delivery/write.\"\"\"\n    method\
+        \ = target.get_method() if isinstance(target, web.Request) else 'GET'\n    for attempt in range(3):\n\
+        \        try:\n            return open_fn(target, *args, **kwargs)\n        except urllib.error.HTTPError\
+        \ as error:\n            if method != 'GET' or attempt == 2 or error.code not in (429, 500, 502,\
+        \ 503, 504):\n                raise\n            delay = error.headers.get('Retry-After', str(2\
+        \ ** (attempt + 1)))\n            if not delay.isdigit() or int(delay) > 30:\n               \
+        \ raise\n            time.sleep(max(1, int(delay)))\n        except (urllib.error.URLError, TimeoutError,\
+        \ ConnectionError):\n            if method != 'GET' or attempt == 2:\n                raise\n\
+        \            time.sleep(2 ** (attempt + 1))\n\n\ndef encode_state(state):\n    raw = json.dumps(state,\
+        \ separators=(',', ':')).encode()\n    if len(raw) > 20_000_000:\n        raise RuntimeError('Expanded\
+        \ state limit reached; delivery history retained')\n    if len(raw) > 400_000:\n        raw =\
+        \ json.dumps({'version': 1, 'encoding': 'xz-base64',\n                         'data': base64.b64encode(lzma.compress(raw)).decode()},\n\
+        \                         separators=(',', ':')).encode()\n    return raw\n\n\ndef decode_state(payload):\n\
+        \    state = json.loads(payload)\n    if state.get('encoding') == 'xz-base64':\n        with lzma.LZMAFile(io.BytesIO(base64.b64decode(state['data'],\
+        \ validate=True))) as stream:\n            raw = stream.read(20_000_001)\n        if len(raw)\
+        \ > 20_000_000:\n            raise RuntimeError('Expanded state limit exceeded; refusing reset')\n\
+        \        state = json.loads(raw)\n    elif state.get('encoding'):\n        raise RuntimeError('Unknown\
+        \ state encoding; refusing reset')\n    return state\n\n\nBASE = 'https://www.screener.in'\nSTATE_PATH\
+        \ = 'market-pulse-state.json'\nMAX_PAGES = 2\nMAX_SEND = 30\nFII_SOURCE = 'https://www.nseindia.com/reports/fii-dii'\n\
+        FII_API = 'https://www.nseindia.com/api/fiidiiTradeReact'\nSOURCES = [\n    ('Bulk Deals', '/trades/bulk/?o=-2'),\n\
+        \    ('Block Deals', '/trades/block/?o=-2'),\n    ('SAST Trades', '/trades/sast/?o=-2'),\n   \
+        \ ('Insider Trades', '/trades/insiders/?o=-2'),\n    ('Bonus', '/actions/bonus/?o=-1'),\n    ('Rights',\
+        \ '/actions/right/?o=-1'),\n    ('Split', '/actions/split/?o=-1'),\n    ('Buyback', '/actions/buyback/?o=-1'),\n\
+        \    ('Dividend', '/actions/dividend/?o=-1'),\n    ('Concalls', '/concalls/'),\n    ('Upcoming\
+        \ Concalls', '/concalls/upcoming/'),\n    ('Annual Reports', '/annual-reports/'),\n    ('Upcoming\
+        \ Results', '/upcoming-results/'),\n]\n\n\ndef digest(value):\n    return hashlib.sha256(value.encode()).hexdigest()\n\
+        \n\ndef safe_link(value):\n    target = url.urljoin(BASE, value)\n    p = url.urlparse(target)\n\
+        \    host = (p.hostname or '').lower()\n    if p.scheme == 'https' and not p.username and not\
+        \ p.password and any(\n            host == d or host.endswith('.' + d)\n            for d in ('screener.in',\
+        \ 'bseindia.com', 'nseindia.com')):\n        return target\n    return None\n\n\ndef parse_items(page,\
+        \ name, source):\n    soup = BeautifulSoup(page, 'html.parser')\n    main = soup.find('main')\
+        \ or soup\n    title = main.find('h1')\n    if not title:\n        raise RuntimeError('Section\
+        \ heading missing')\n    table = main.select_one('table#result_list')\n    if table is None:\n\
+        \        tables = main.select('table')\n        if len(tables) == 1:\n            table = tables[0]\n\
+        \    items = []\n    if table is not None:\n        head_rows = table.select('thead tr')\n   \
+        \     if len(head_rows) != 1:\n            raise RuntimeError('Multi-level or missing table header;\
+        \ layout review required')\n        heads = head_rows[0].find_all(['th', 'td'], recursive=False)\n\
+        \        if any(int(c.get('colspan', 1)) != 1 or int(c.get('rowspan', 1)) != 1 for c in heads):\n\
+        \            raise RuntimeError('Merged header cells; layout review required')\n        headers\
+        \ = [h.get_text(' ', strip=True) for h in heads]\n        if len(headers) < 2 or any(not h for\
+        \ h in headers):\n            raise RuntimeError('Incomplete table labels')\n        for row in\
+        \ table.select('tbody tr'):\n            cells = row.find_all(['th', 'td'], recursive=False)\n\
+        \            if len(cells) == 1 and int(cells[0].get('colspan', 1)) > 1:\n                if re.search(r'no\
+        \ (results|records)', cells[0].get_text(' ', strip=True), re.I):\n                    continue\n\
+        \            if len(cells) != len(headers) or any(int(c.get('colspan', 1)) != 1 or int(c.get('rowspan',\
+        \ 1)) != 1 for c in cells):\n                raise RuntimeError('Table labels do not match values')\n\
+        \            values = [c.get_text(' ', strip=True) for c in cells]\n            if not any(values):\n\
+        \                continue\n            if any(len(v) > 500 for v in values):\n               \
+        \ raise RuntimeError('Unexpectedly long table value')\n            links = list(dict.fromkeys(filter(None,\
+        \ (safe_link(a['href']) for a in row.select('a[href]')))))\n            lines = [f'{h}: {v or\
+        \ \"Not provided\"}' for h, v in zip(headers, values)]\n            identity = digest(name + '|'\
+        \ + json.dumps(list(zip(headers, values)), ensure_ascii=False))\n            text = name + '\\\
+        n\\n' + '\\n'.join(lines)\n            text += '\\n\\nSource: Screener\\n' + source\n        \
+        \    if links:\n                text += '\\nRelated link: ' + links[0]\n            if len(text)\
+        \ > 3900:\n                raise RuntimeError('Record exceeds Telegram message limit')\n     \
+        \       items.append({'id': identity, 'section': name, 'text': text})\n    elif name == 'Annual\
+        \ Reports':\n        for a in main.select('a[href]'):\n            target = safe_link(a['href'])\n\
+        \            if not target or not ('.pdf' in target.lower() or 'downloadattach' in target.lower()):\n\
+        \                continue\n            label = a.get_text(' ', strip=True)\n            company\
+        \ = ''\n            for parent in a.parents:\n                if parent.name in ('main', 'body',\
+        \ 'html'):\n                    break\n                companies = parent.select('a[href*=\"/company/\"\
+        ]')\n                if len(companies) > 1:\n                    break\n                if len(companies)\
+        \ == 1:\n                    company = companies[0].get_text(' ', strip=True)\n              \
+        \      break\n            text = 'Annual Reports\\n\\n' + (company + '\\n' if company else '')\n\
+        \            text += (label[:500] or 'Annual report document')\n            text += '\\n\\nDocument:\
+        \ ' + target + '\\nSource: Screener\\n' + source\n            items.append({'id': digest(name\
+        \ + '|' + target), 'section': name, 'text': text})\n        if not items:\n            raise RuntimeError('Annual\
+        \ report document layout not recognised')\n    else:\n        raise RuntimeError('Expected table\
+        \ not found')\n    return list({item['id']: item for item in items}.values())\n\n\ndef following_page(page,\
+        \ current):\n    soup = BeautifulSoup(page, 'html.parser')\n    parsed = url.urlparse(current)\n\
+        \    candidates = []\n    for a in soup.select('a[href]'):\n        label = a.get_text(' ', strip=True).lower()\n\
+        \        if 'next' in a.get('rel', []) or re.fullmatch(r'next\\s*[→»›]?', label):\n          \
+        \  candidates.append(a['href'])\n    # Django list pages expose numbered links without a Next\
+        \ button.\n    current_number = 1\n    for selected in soup.select('.paginator .this-page, .pagination\
+        \ .current'):\n        if selected.get_text(strip=True).isdigit():\n            current_number\
+        \ = int(selected.get_text(strip=True))\n    for a in soup.select('.paginator a[href], .pagination\
+        \ a[href]'):\n        if a.get_text(strip=True) == str(current_number + 1):\n            candidates.append(a['href'])\n\
+        \    for href in candidates:\n        target = url.urljoin(current, href)\n        p = url.urlparse(target)\n\
+        \        if p.scheme == 'https' and p.hostname == parsed.hostname and p.path == parsed.path and\
+        \ target != current:\n            return target\n    return None\n\n\ndef fii_item(data):\n  \
+        \  \"\"\"Require dated, internally consistent cash-market figures from NSE.\"\"\"\n    if not\
+        \ isinstance(data, list):\n        raise RuntimeError('NSE institutional data is not a list')\n\
+        \    rows = {r.get('category'): r for r in data if isinstance(r, dict)}\n    if not {'FII/FPI',\
+        \ 'DII'}.issubset(rows):\n        raise RuntimeError('NSE FII/FPI or DII row missing')\n    selected\
+        \ = [rows['FII/FPI'], rows['DII']]\n    if selected[0].get('date') != selected[1].get('date'):\n\
+        \        raise RuntimeError('NSE institutional dates do not match')\n    date_label = selected[0].get('date',\
+        \ '')\n    try:\n        day = datetime.strptime(date_label, '%d-%b-%Y').date()\n    except ValueError:\n\
+        \        raise RuntimeError('NSE institutional date format not recognised') from None\n    age\
+        \ = (datetime.now(ZoneInfo('Asia/Kolkata')).date() - day).days\n    if not 0 <= age <= 10:\n \
+        \       raise RuntimeError('NSE institutional data is stale or future dated')\n    lines = ['FII/FPI\
+        \ & DII cash-market activity', 'Trade date: ' + date_label,\n             'Amounts: INR crore\
+        \ | Provisional data']\n    normalised = []\n    for row in selected:\n        try:\n        \
+        \    buy, sell, net = [Decimal(str(row[k]).replace(',', ''))\n                              for\
+        \ k in ('buyValue', 'sellValue', 'netValue')]\n        except (InvalidOperation, KeyError):\n\
+        \            raise RuntimeError('NSE institutional numeric field invalid') from None\n       \
+        \ if not all(n.is_finite() for n in (buy, sell, net)) or buy < 0 or sell < 0 or abs(buy - sell\
+        \ - net) > Decimal('0.05'):\n            raise RuntimeError('NSE institutional totals do not reconcile')\n\
+        \        lines.extend(['', row['category'], f'Buy: {buy:,.2f}', f'Sell: {sell:,.2f}', f'Net: {net:+,.2f}'])\n\
+        \        normalised.append([row['category'], str(buy.normalize()), str(sell.normalize()), str(net.normalize())])\n\
+        \    lines.extend(['', 'Daily market totals; these do not identify purchases in individual stocks.',\n\
+        \                  'Revised source figures may generate a further alert.', 'Source: NSE', FII_SOURCE])\n\
+        \    return {'id': digest('NSE-FII-DII|' + date_label + '|' + json.dumps(normalised)),\n     \
+        \       'section': 'FII/DII (NSE)', 'text': '\\n'.join(lines)}\n\n\ndef read_fii():\n    # Independent\
+        \ of the signed-in Screener session; no account secrets go to NSE.\n    request = web.Request(FII_API,\
+        \ headers={'User-Agent': 'Mozilla/5.0',\n        'Accept': 'application/json', 'Referer': FII_SOURCE})\n\
+        \    with safe_open(web.urlopen, request, timeout=15) as r:\n        return fii_item(json.load(r))\n\
+        \n\ndef login():\n    client = web.build_opener(web.HTTPCookieProcessor(http.cookiejar.CookieJar()))\n\
+        \    client.addheaders = [('User-Agent', 'Mozilla/5.0')]\n    with safe_open(client.open, BASE\
+        \ + '/login/', timeout=20) as r:\n        csrf = BeautifulSoup(r.read(), 'html.parser').select_one('input[name=\"\
+        csrfmiddlewaretoken\"]')\n    if not csrf:\n        raise RuntimeError('Login form token missing')\n\
+        \    data = url.urlencode({'username': os.environ['SCREENER_EMAIL'].strip(),\n        'password':\
+        \ os.environ['SCREENER_PASSWORD'], 'csrfmiddlewaretoken': csrf['value'],\n        'next': '/announcements/'}).encode()\n\
+        \    with safe_open(client.open, web.Request(BASE + '/login/', data=data,\n            headers={'Referer':\
+        \ BASE + '/login/'}), timeout=20) as r:\n        r.read()\n    with safe_open(client.open, BASE\
+        \ + '/announcements/', timeout=20) as r:\n        if url.urlparse(r.url).path != '/announcements/'\
+        \ or b'Latest Announcements' not in r.read():\n            raise RuntimeError('Screener login\
+        \ not confirmed')\n    return client\n\n\nclass StateStore:\n    def __init__(self):\n       \
+        \ self.branch = os.environ['GITHUB_REF_NAME']\n        self.endpoint = 'https://api.github.com/repos/'\
+        \ + os.environ['GITHUB_REPOSITORY'] + '/contents/' + STATE_PATH\n        self.sha = None\n   \
+        \     self.state = {'version': 1, 'seen': {}, 'pending': [], 'initialized': [], 'setup_sent':\
+        \ False}\n\n    def api(self, target, data=None):\n        req = web.Request(target, data=json.dumps(data).encode()\
+        \ if data is not None else None,\n            headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],\
+        \ 'Accept': 'application/vnd.github+json',\n                     'Content-Type': 'application/json',\
+        \ 'User-Agent': 'Darpan-Market-Pulse'},\n            method='PUT' if data is not None else 'GET')\n\
+        \        with safe_open(web.urlopen, req, timeout=25) as r:\n            return json.load(r)\n\
+        \n    def read(self):\n        try:\n            data = self.api(self.endpoint + '?ref=' + url.quote(self.branch,\
+        \ safe=''))\n        except urllib.error.HTTPError as error:\n            if error.code != 404:\n\
+        \                raise\n            return\n        self.sha = data['sha']\n        state = decode_state(base64.b64decode(data['content']))\n\
+        \        if state.get('version') != 1 or not isinstance(state.get('seen'), dict) or not isinstance(state.get('pending'),\
+        \ list) or not isinstance(state.get('initialized'), list):\n            raise RuntimeError('Invalid\
+        \ saved state; refusing to reset history')\n        self.state = state\n\n    def save(self):\n\
+        \        payload = encode_state(self.state)\n        if len(payload) > 850000:\n            raise\
+        \ RuntimeError('State size limit reached; queue retained')\n        data = {'message': 'Update\
+        \ Market Pulse delivery state', 'branch': self.branch,\n                'content': base64.b64encode(payload).decode()}\n\
+        \        if self.sha:\n            data['sha'] = self.sha\n        self.sha = self.api(self.endpoint,\
+        \ data)['content']['sha']\n\n\ndef send(text):\n    payload = json.dumps({'chat_id': os.environ['CHAT_ID'].strip(),\
+        \ 'text': text,\n        'link_preview_options': {'is_disabled': True}}).encode()\n    request\
+        \ = web.Request('https://api.telegram.org/bot' + os.environ['BOT_TOKEN'].strip() + '/sendMessage',\n\
+        \        data=payload, headers={'Content-Type': 'application/json'})\n    with safe_open(web.urlopen,\
+        \ request, timeout=25) as r:\n        if not json.load(r).get('ok'):\n            raise RuntimeError('Telegram\
+        \ rejected delivery')\n\n\ndef monitor(client, store):\n    state = store.state\n    now = int(time.time())\n\
+        \    state['seen'] = {k: v for k, v in state['seen'].items() if now - v < 180 * 86400}\n    sweeps\
+        \ = state.setdefault('sweeps', {})\n    results, failed = [], []\n    deadline = time.monotonic()\
+        \ + 9 * 60\n    for name, path in SOURCES:\n        if time.monotonic() >= deadline:\n       \
+        \     results.append((name, 'Deferred to next run: time budget', 0, 0))\n            continue\n\
+        \        target, visited, items, capped = BASE + path, set(), [], False\n        try:\n      \
+        \      while target and len(visited) < MAX_PAGES:\n                if target in visited:\n   \
+        \                 raise RuntimeError('Pagination loop detected')\n                visited.add(target)\n\
+        \                with safe_open(client.open, target, timeout=15) as r:\n                    if\
+        \ url.urlparse(r.url).path != url.urlparse(path).path:\n                        raise RuntimeError('Section\
+        \ redirected; access not confirmed')\n                    page = r.read().decode()\n         \
+        \       items.extend(parse_items(page, name, BASE + path))\n                target = following_page(page,\
+        \ target)\n                time.sleep(1)\n            head_next = target\n            capped =\
+        \ bool(target)\n            items = list({item['id']: item for item in items}.values())\n    \
+        \        new_count = 0\n            if name not in state['initialized']:\n                state['seen'].update({item['id']:\
+        \ now for item in items})\n                state['initialized'].append(name)\n               \
+        \ status = 'Baseline saved'\n            else:\n                queued = {i['id'] for i in state['pending']}\n\
+        \                for item in items:\n                    if item['id'] in state['seen']:\n   \
+        \                     state['seen'][item['id']] = now\n                    elif item['id'] not\
+        \ in queued:\n                        state['pending'].append(item)\n                        queued.add(item['id'])\n\
+        \                        new_count += 1\n                status = 'Checked'\n            # Continue\
+        \ through older pages across runs instead of stopping forever\n            # at page two. The\
+        \ first extended sweep silently seeds older history.\n            sweep = sweeps.setdefault(name,\
+        \ {'next': None, 'baseline': True, 'completed': 0})\n            continuation = sweep.get('next')\
+        \ or head_next\n            sweep_note = ''\n            if continuation and time.monotonic()\
+        \ < deadline:\n                parsed = url.urlparse(continuation)\n                if parsed.scheme\
+        \ != 'https' or parsed.hostname != 'www.screener.in' or parsed.path != url.urlparse(path).path:\n\
+        \                    raise RuntimeError('Saved pagination URL is invalid')\n                with\
+        \ safe_open(client.open, continuation, timeout=15) as r:\n                    if url.urlparse(r.url).path\
+        \ != url.urlparse(path).path:\n                        raise RuntimeError('Extended scan access\
+        \ not confirmed')\n                    older_page = r.read().decode()\n                older_items\
+        \ = parse_items(older_page, name, BASE + path)\n                queued = {i['id'] for i in state['pending']}\n\
+        \                for item in older_items:\n                    if sweep['baseline'] or item['id']\
+        \ in state['seen']:\n                        state['seen'][item['id']] = now\n               \
+        \     elif item['id'] not in queued:\n                        state['pending'].append(item)\n\
+        \                        queued.add(item['id'])\n                        new_count += 1\n    \
+        \            after = following_page(older_page, continuation)\n                if after == continuation:\n\
+        \                    raise RuntimeError('Extended pagination loop detected')\n               \
+        \ sweep['next'] = after\n                items.extend(older_items)\n                if after is\
+        \ None:\n                    sweep['baseline'] = False\n                    sweep['completed']\
+        \ += 1\n                    sweep_note = '; full sweep completed'\n                else:\n   \
+        \                 sweep_note = '; older-page scan continues next run'\n                time.sleep(1)\n\
+        \            elif not continuation:\n                sweep['next'] = None\n                sweep['baseline']\
+        \ = False\n                sweep['completed'] += 1\n                sweep_note = '; all available\
+        \ pages checked'\n            else:\n                sweep_note = '; extended scan deferred'\n\
+        \            results.append((name, status + sweep_note, len({i['id'] for i in items}), new_count))\n\
+        \            store.save()  # Checkpoint the queue and pagination after every section.\n      \
+        \      print(name + ': ' + status + '; records=' + str(len(items)) + '; new=' + str(new_count),\
+        \ flush=True)\n        except Exception as error:\n            failed.append(name)\n         \
+        \   detail = type(error).__name__ + (' HTTP ' + str(error.code) if isinstance(error, urllib.error.HTTPError)\
+        \ else '')\n            if isinstance(error, RuntimeError):\n                detail += ': ' +\
+        \ str(error)\n            print('SECTION FAILED: ' + name + ' - ' + detail, flush=True)\n    \
+        \        results.append((name, detail, 0, 0))\n    # One dated FII/FPI + DII message on first\
+        \ successful access, then only if\n    # the source date or figures change. Failure leaves the\
+        \ other queues intact.\n    try:\n        item = read_fii()\n        queued = {i['id'] for i in\
+        \ state['pending']}\n        new = int(item['id'] not in state['seen'] and item['id'] not in queued)\n\
+        \        if new:\n            state['pending'].append(item)\n        elif item['id'] in state['seen']:\n\
+        \            state['seen'][item['id']] = now\n        results.append(('FII/DII (NSE)', 'Dated\
+        \ data verified', 2, new))\n    except Exception as error:\n        failed.append('FII/DII (NSE)')\n\
+        \        detail = type(error).__name__ + (' HTTP ' + str(error.code) if isinstance(error, urllib.error.HTTPError)\
+        \ else '')\n        if isinstance(error, RuntimeError):\n            detail += ': ' + str(error)\n\
+        \        results.append(('FII/DII (NSE)', detail, 0, 0))\n        print('FII/DII UNAVAILABLE:\
+        \ ' + detail, flush=True)\n    if not state['initialized']:\n        raise RuntimeError('No section\
+        \ could be read; no messages sent')\n    setup_id = digest('market-pulse-monitor-started-v1')\n\
+        \    if not state.get('setup_sent') and not any(i['id'] == setup_id for i in state['pending']):\n\
+        \        state['pending'].insert(0, {'id': setup_id, 'section': 'Setup', 'text':\n           \
+        \ 'Market Pulse monitoring started\\n\\nBaseline saved for: ' + ', '.join(state['initialized'])\
+        \ +\n            '\\n\\nExisting history was not broadcast. New or changed records found in monitored\
+        \ pages will be sent.' +\n            '\\nChecks are scheduled about every 30 minutes; GitHub\
+        \ may delay them.' +\n            '\\nThe first two pages are checked each run; older pages are\
+        \ scanned progressively.' +\n            '\\nFII/FPI and DII daily totals use NSE when its dated\
+        \ data is reachable.'})\n    store.save()  # Queue must be durable before Telegram delivery.\n\
+        \    sent = 0\n    while state['pending'] and sent < MAX_SEND:\n        item = state['pending'][0]\n\
+        \        send(item['text'])\n        state['seen'][item['id']] = int(time.time())\n        state['pending'].pop(0)\n\
+        \        if item['id'] == setup_id:\n            state['setup_sent'] = True\n        store.save()\n\
+        \        sent += 1\n        time.sleep(1.2)\n    print(f'SUCCESS: Sent: {sent} | Waiting: {len(state[\"\
+        pending\"])} | Sections failed: {len(failed)}', flush=True)\n    if os.environ.get('GITHUB_STEP_SUMMARY'):\n\
+        \        with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:\n            f.write('# Market\
+        \ Pulse alerts\\n\\n| Section | Status | Read | New |\\n|---|---|---:|---:|\\n')\n           \
+        \ for row in results:\n                f.write('| ' + ' | '.join(map(str, row)) + ' |\\n')\n \
+        \           f.write(f'\\nSent: {sent}. Waiting: {len(state[\"pending\"])}.\\n\\n')\n         \
+        \   f.write('First successful check of each section saves history without sending older rows.\
+        \ Later checks send newly observed or changed rows, which may include older dated records newly\
+        \ entering these pages.\\n\\n')\n            f.write('The first two pages are checked each run,\
+        \ plus one older page per section. Older-page scans resume across runs; the first extended sweep\
+        \ seeds older history silently. Later full sweeps look for newly observed or changed records.\
+        \ Fast-moving pagination and source delays can still cause missed records; full real-time coverage\
+        \ is not guaranteed.\\n\\n')\n            f.write('FII/FPI and DII are dated provisional cash-market\
+        \ totals from NSE, not company-specific holdings. Annual reports are document alerts, not report\
+        \ summaries. Existing Corporate Auto Alerts handles announcements and quarterly figures separately.\\\
+        n')\n    if failed:\n        raise RuntimeError('Some sections failed; successful sections and\
+        \ pending queue were saved')\n\n\ndef main():\n    try:\n        if not all(os.environ.get(k)\
+        \ for k in ('SCREENER_EMAIL', 'SCREENER_PASSWORD', 'BOT_TOKEN', 'CHAT_ID', 'GH_TOKEN')):\n   \
+        \         raise RuntimeError('Required GitHub secret or token missing')\n        store = StateStore()\n\
+        \        store.read()\n        monitor(login(), store)\n    except Exception as error:\n     \
+        \   print('FAILED: ' + type(error).__name__, flush=True)\n        if isinstance(error, RuntimeError):\n\
+        \            print(str(error), flush=True)\n        elif isinstance(error, urllib.error.HTTPError):\n\
+        \            print('HTTP status: ' + str(error.code), flush=True)\n        raise SystemExit(1)\n\
+        \n\nif __name__ == '__main__':\n    main()\n"

@@ -20,8 +20,8 @@ function selectIncomeLevel(stock,parent,entryTF){
  const locationOK=['Low','Very Low'].includes(location)&&curve.demand?.date===parent.date;
  const levels=stock.zones.filter(z=>z.tf===entryTF&&!z.broken&&!z.freshnessUnspecified&&!z.contextOnly&&(z.fresh||z.firstReturn)&&z.d>=parent.d&&z.d<=stock.cmp&&z.d>0&&z.p>z.d);
  const evaluated=levels.map(z=>{
-  const support=stock.zones.filter(h=>HTF.includes(h.tf)&&engine.TF.indexOf(h.tf)>engine.TF.indexOf(entryTF)&&!h.broken&&!h.freshnessUnspecified&&(h.fresh||h.firstReturn||h.currentInside)&&h.p>=z.d&&h.p<=z.p&&h.departureAchievement?.known&&h.departureAchievement.strong===true&&h.departureAchievement.closeConfirmed===true);
-  const keypoints=support.map(h=>({tf:h.tf,date:h.date,proximal:h.p,grade:h.departureAchievement.grade,supplyBreakCount:h.departureAchievement.supplyBreakCount,through:h.departureAchievement.through}));
+  const support=stock.zones.filter(h=>HTF.includes(h.tf)&&engine.TF.indexOf(h.tf)>engine.TF.indexOf(entryTF)&&!h.broken&&!h.freshnessUnspecified&&(h.fresh||h.firstReturn||h.currentInside)&&h.p>=z.d&&h.p<=z.p);
+  const keypoints=support.map(h=>({tf:h.tf,date:h.date,proximal:h.p,grade:h.departureAchievement?.grade||0,supplyBreakCount:h.departureAchievement?.supplyBreakCount||0,through:h.departureAchievement?.through||null}));
   const enriched={...z,matches:keypoints.map(h=>({...h,p:h.proximal,matchType:'Achievement proximal within entry range'}))};
   return {z:enriched,keypoints,quality:engine.selection(enriched),score:engine.score(enriched).total,components:engine.score(enriched).components,parentDistance:Math.max(0,z.d-parent.p,parent.d-z.p)};
  });

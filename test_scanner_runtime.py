@@ -424,9 +424,9 @@ console.log('Best level gates passed');
  def test_message_labels_levels_as_reference_and_fits_telegram(self):
   fixture=AlertUpgradeTests();stock=fixture.stock();z=fixture.zone()
   ref={'parentTF':'Monthly','parentDate':z['date'],'parentD':z['d'],'parentP':z['p'],'trendTF':'Weekly','trend':'Up','entryTF':'Daily','status':'WAIT_RETEST','zoneDate':'2026-09-01','distal':95,'proximal':105,'entryReference':105,'stopReference':95,'targets':[{'rr':r,'price':105+r*10} for r in (2,3,4)]}
-  stock['entry_references']=[ref];items=[dict(fixture.evidence(),buyer='Fund '+str(i)+'x'*170) for i in range(30)]
+  ref['achievementKeypoints']=[{'tf':'Quarterly','proximal':100,'date':'2026-01-01','grade':0}];stock['entry_references']=[ref];items=[dict(fixture.evidence(),buyer='Fund '+str(i)+'x'*170) for i in range(30)]
   msg=s.timeframe_alert(stock,'Monthly',[(z,items)],[(z,items)])
-  self.assertIn('NOT Entry Ready',msg['text']);self.assertIn('SL boundary INR 95.00',msg['text']);self.assertIn('1:2 125.00',msg['text']);self.assertIn('Buffers, risk sizing',msg['text']);self.assertLessEqual(len(msg['text']),4096)
+  self.assertIn('NOT Entry Ready',msg['text']);self.assertIn('SL boundary INR 95.00',msg['text']);self.assertIn('1:2 125.00',msg['text']);self.assertIn('Buffers, risk sizing',msg['text']);self.assertIn('HTF support:',msg['text']);self.assertNotIn('HTF achievement:',msg['text']);self.assertLessEqual(len(msg['text']),4096)
   other=s.entry_reference_text(stock,'Quarterly',[(dict(z,tf='Quarterly'),items)])
   self.assertNotIn('105.00',other)
 

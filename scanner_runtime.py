@@ -461,9 +461,28 @@ def timeframe_groups(matched):
     for zone,items in matched:groups.setdefault(zone['tf'],[]).append((zone,items))
     return {tf:sorted(groups[tf],key=lambda pair:(pair[0]['date'],pair[0].get('latestTouch') or '')) for tf in TIMEFRAME_CODES if tf in groups}
 
+def entry_reference_text(stock,tf,group):
+    zones={(z['date'],z['d'],z['p']) for z,_ in group}
+    refs=[r for r in stock.get('entry_references',[]) if r['parentTF']==tf and (r['parentDate'],r['parentD'],r['parentP']) in zones]
+    if not refs:return 'Entry review: no verified lower-timeframe reference available. Entry Ready is not enabled.'
+    statuses={'WAIT_ENTRY_ZONE':'Waiting for a qualified nested entry zone','WAIT_SUPPLY_CLOSE':'Waiting for completed supply close above distal','WAIT_RETEST':'Waiting for demand retest / price at entry zone','REVIEW_REQUIRED':'Automated observations present; analyst review required'}
+    lines=['Entry references only | NOT Entry Ready']
+    for r in sorted(refs,key=lambda r:('entryReference' not in r, r.get('parentDate','')),reverse=False)[:2]:
+        lines.append(r['trendTF']+' trend: '+r['trend']+' (chart review needed) | '+r['entryTF']+' entry')
+        lines.append(statuses[r['status']])
+        if 'entryReference' in r:
+            lines.append(f"{r['entryTF']} demand {r['distal']:.2f}–{r['proximal']:.2f} | formed {r['zoneDate']}")
+            lines.append(f"Unbuffered entry boundary INR {r['entryReference']:.2f} | SL boundary INR {r['stopReference']:.2f}")
+            lines.append('Reference targets: '+ ' | '.join(f"1:{t['rr']} {t['price']:.2f}" for t in r['targets']))
+            if r.get('supplyClose'):lines.append('Completed supply close observed '+r['supplyClose']['date'][:10])
+            if r.get('retestDate'):lines.append('Retest observed '+r['retestDate'][:10])
+    lines.append('Buffers, risk sizing, proper-fall / marking and achievement review pending. Targets exclude costs and slippage.')
+    return '\n'.join(lines)
+
 def timeframe_alert(stock,tf,group,all_matches):
     others=[TIMEFRAME_CODES[k] for k in timeframe_groups(all_matches) if k!=tf]
-    text=alert_text(stock,group)
+    reference=entry_reference_text(stock,tf,group)
+    text=alert_text(stock,group,budget=max(1600,3850-len(reference)))+'\n\n'+reference
     if others:text+='\nAlso matching: '+', '.join(others)+' (separate alerts).'
     return {'id':match_identity(stock['symbol'],group),'kind':'timeframe_match','timeframe':tf,
             'text':TIMEFRAME_CODES[tf]+' | '+tf+' Demand\n'+text,'watches':alert_watches(stock,group)}
@@ -551,7 +570,7 @@ def display_evidence(items):
             if not groups[kind]:del groups[kind]
     return result
 
-def alert_text(stock,matched):
+def alert_text(stock,matched,budget=3950):
     quote=stock['quality']['quote'];lines=['Institutional evidence + HTF demand',stock['symbol']+' | '+quote['kind']+' INR '+str(round(stock['cmp'],2)), 'Price as of '+quote['asof']+' | Exchange '+stock['quality'].get('exchange','NSE')]
     membership=stock.get('universe_membership',{})
     if membership.get('current_source_verified') is False:lines.append('Index membership last verified '+membership['verified_at']+'; current membership source unavailable.')
@@ -572,7 +591,7 @@ def alert_text(stock,matched):
         if e.get('date_basis')=='NSE transaction period':block.extend([e['mode'],'Published '+e['reported_at']])
         elif 'amc_id' not in e:block.append('Date basis: '+e.get('date_basis','Source trade date'))
         block.append(e['source']);text='\n'.join(block)
-        if shown>=5 or len('\n'.join(lines))+len(text)+len(footer)+180>3950:break
+        if shown>=5 or len('\n'.join(lines))+len(text)+len(footer)+180>budget:break
         lines.append(text);shown+=1
     if len(buyers)>shown:lines.append(str(len(buyers)-shown)+' additional qualifying records retained in scan state.')
     lines.append(footer)

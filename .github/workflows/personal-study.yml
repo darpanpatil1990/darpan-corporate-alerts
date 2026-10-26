@@ -1,0 +1,24 @@
+name: Darpan Personal STUDY
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: institutional-demand-alerts
+  cancel-in-progress: false
+jobs:
+  study:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install beautifulsoup4==4.14.3 cryptography==50.0.2
+      - name: Verify combined study gates, context and disclaimer
+        run: python -m unittest test_personal_study.py test_sector_rotation.py
+      - name: Deliver Darpan Personal STUDY privately
+        run: python personal_study.py
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.INSTITUTIONAL_PRIVATE_CHAT_ID }}

@@ -113,7 +113,9 @@ def load_related(results):
             source = 'https://www.niftyindices.com'+normalized_path
             raw = read_bytes(source)
         members = constituent_members(raw.decode('utf-8-sig'))
-        return name,dict(eligible_stocks(members,universe,caps),source=source)
+        item = eligible_stocks(members,universe,caps)
+        item['stock_isins'] = {symbol:isin for isin,symbol in universe.items() if symbol in item['stocks']}
+        return name,dict(item,source=source)
     related, failures = {}, []
     def safe_fetch(name):
         try:
@@ -333,6 +335,10 @@ def main():
     destination = verify_private_destination()
     store = Store('sector-rotation-state.json')
     store.read()
+    store.state['rotation_snapshot'] = {'version':1,'week':friday.isoformat(),
+        'close_date':weeks[-1]['date'],'generated_at':datetime.now(IST).isoformat(),
+        'results':results,'related':related}
+    store.save()
     # Include the full input window so historical revisions are detectable.
     identity = hashlib.sha256(json.dumps(weeks,sort_keys=True).encode()).hexdigest()
     def send(message):

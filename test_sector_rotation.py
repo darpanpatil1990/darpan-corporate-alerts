@@ -66,6 +66,44 @@ class RotationTests(unittest.TestCase):
         self.assertEqual(store.state['delivered'],[])
         self.assertEqual(len(store.state['pending']),1)
 
+    def test_constituent_identity_and_equity_only(self):
+        raw='Company Name,Symbol,Series,ISIN Code\nOne,ONE,EQ,INE000000001\nReit,REIT,RR,INE000000002\nPlaceholder,DUMMY,EQ,DUM000000001\n'
+        self.assertEqual(s.constituent_members(raw),{'INE000000001':'ONE'})
+        with self.assertRaises(ValueError):
+            s.constituent_members(raw+'Duplicate,ONE,EQ,INE000000001\n')
+
+    def test_exact_isin_join_strict_cap_and_missing(self):
+        members={f'INE00000000{i}':'old'+str(i) for i in range(1,6)}
+        universe={f'INE00000000{i}':'NEW'+str(i) for i in range(1,5)}
+        caps={'NEW1':{'stock_isin':'INE000000001','cap':'500'},
+              'NEW2':{'stock_isin':'INE000000002','cap':'500.01'},
+              'NEW3':{'stock_isin':'INE000000009','cap':'10000'}}
+        result=s.eligible_stocks(members,universe,caps)
+        self.assertEqual(result,{'stocks':['NEW2'],'cap_unavailable':['NEW3','NEW4'],'cap_excluded':1})
+
+    def test_related_message_groups_dedup_and_no_buy_inference(self):
+        results={'Nifty Bank':{'group':'Leading'},'Nifty IT':{'group':'Lagging'}}
+        data={'Nifty Bank':{'stocks':['ABC','XYZ'],'cap_unavailable':[],'cap_excluded':0},
+              'Nifty IT':{'unavailable':'HTTPError'}}
+        one=s.related_messages(results,data,'2026-10-23','2026-10-26')
+        two=s.related_messages(results,data,'2026-10-23','2026-10-27')
+        self.assertEqual(len(one),2)
+        self.assertEqual([x[0] for x in one],[x[0] for x in two])
+        self.assertIn('Bank (2): ABC, XYZ',one[0][1])
+        self.assertIn('not stock RS ranking or a Buy signal',one[0][1])
+        self.assertIn('source unavailable',one[1][1])
+        data['Nifty Bank']['stocks'].append('NEW')
+        self.assertNotEqual(one[0][0],s.related_messages(results,data,'2026-10-23','2026-10-27')[0][0])
+
+    def test_related_message_pagination_no_silent_truncation(self):
+        results={f'Nifty Test{i}':{'group':'Leading'} for i in range(20)}
+        data={n:{'stocks':[f'STOCK{i:03d}' for i in range(30)],'cap_unavailable':[],'cap_excluded':0} for n in results}
+        messages=s.related_messages(results,data,'2026-10-23','2026-10-26')
+        self.assertGreater(len(messages),1)
+        self.assertTrue(all(len(message)<4096 for _,message in messages))
+        for name in results:
+            self.assertEqual(sum(name.removeprefix('Nifty ')+ ' (30):' in message for _,message in messages),1)
+
 
 if __name__=='__main__':
     unittest.main()

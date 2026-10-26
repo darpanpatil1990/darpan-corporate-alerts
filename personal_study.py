@@ -17,17 +17,14 @@ import calendar
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from scanner_runtime import (CompactStore, combined_entry_alert, alert_text, read_bytes,
-                             request, verify_private_destination, IST)
+                             request, verify_private_destination, telegram_text, IST)
 from institutional_confluence import Store
 from sector_rotation import completed_friday
 
 ARS_ANCHOR='2024-05-10'  # Explicit historical public reference, not claimed as the latest official anchor.
 
-DISCLAIMER = ('⚠️ Disclaimer: This alert is for educational and research purposes only and is not a recommendation to buy or sell. '
-              'Demand zones, institutional evidence, and sector strength do not guarantee future returns. '
-              'Data may be delayed or incomplete. Entry, stop-loss, and target levels are study references, not execution instructions. '
-              'Verify all information independently and consider your risk tolerance before trading. '
-              'Investments in securities are subject to market risk.')
+DISCLAIMER = ('⚠️ Personal study only; not a buy/sell recommendation. Levels are unbuffered study references. '
+              'Data may be delayed or incomplete. Verify independently; market risk applies.')
 
 
 def seal(state,secret,aad):
@@ -246,7 +243,7 @@ def study_alert(stock, snapshot, now, strength,eps='Quarterly EPS: Unavailable')
     if budget < 650:
         raise ValueError('Combined study cannot fit complete references and disclaimer')
     evidence=alert_text(stock,matched,budget=budget,include_zones=False)
-    text=prefix+evidence+'\n\n'+DISCLAIMER
+    text=telegram_text(prefix+evidence+'\n\n'+DISCLAIMER)
     if len(text)>4096:
         raise ValueError('Combined study exceeds Telegram limit')
     # Quote ticks and strength changes alone do not create new setup alerts.
@@ -309,7 +306,7 @@ def main():
     store.save()
     def send(message):
         return json.loads(request('https://api.telegram.org/bot'+os.environ['BOT_TOKEN'].strip()+'/sendMessage',
-                                  {'chat_id':os.environ['CHAT_ID'].strip(),'text':message,'disable_web_page_preview':True}))
+                                  {'chat_id':os.environ['CHAT_ID'].strip(),'text':telegram_text(message),'disable_web_page_preview':True}))
     sent=0
     for alert in alerts:
         sent+=deliver(store,alert['text'],alert['id'],destination,send)

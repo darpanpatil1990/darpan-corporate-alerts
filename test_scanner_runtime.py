@@ -296,7 +296,7 @@ class AlertUpgradeTests(unittest.TestCase):
   items=[dict(self.evidence(),buyer='Fund '+str(i)) for i in range(20)]
   items.append({'kind':'Insider acquisition','buyer':'Explicit buyer','buyer_category':'Promoter group','start':'2026-09-12','end':'2026-09-12','qty':500,'mode':'Market Purchase','date_basis':'NSE transaction period','reported_at':'2026-09-14','source':'https://nsearchives.nseindia.com/corporate/proof.xml'})
   text=s.alert_text(self.stock(),[(self.zone(),items)])
-  self.assertIn('Explicit buyer',text);self.assertIn('Promoter group',text);self.assertIn('Published 2026-09-14',text);self.assertIn('proof.xml',text);self.assertIn('not confirmed same-day buys',text);self.assertLessEqual(len(text),3950)
+  self.assertIn('Explicit buyer',text);self.assertIn('Promoter group',text);self.assertIn('Published 2026-09-14',text);self.assertNotIn('https://',text);self.assertIn('not confirmed same-day buys',text);self.assertLessEqual(len(text),3950)
  def test_source_types_are_represented_before_second_same_type(self):
   items=[dict(self.evidence(),buyer=str(i)) for i in range(6)]+[dict(self.evidence(),kind='Bulk acquisition',buyer='Bulk',amc_id=None)]
   self.assertEqual(len({e['kind'] for e in s.display_evidence(items)[:2]}),2)
@@ -426,7 +426,7 @@ console.log('Best level gates passed');
   ref={'parentTF':'Monthly','parentDate':z['date'],'parentD':z['d'],'parentP':z['p'],'trendTF':'Weekly','trend':'Up','entryTF':'Daily','status':'WAIT_RETEST','zoneDate':'2026-09-01','distal':95,'proximal':105,'entryReference':105,'stopReference':95,'targets':[{'rr':r,'price':105+r*10} for r in (2,3,4)]}
   ref['achievementKeypoints']=[{'tf':'Quarterly','proximal':100,'date':'2026-01-01','grade':0}];stock['entry_references']=[ref];items=[dict(fixture.evidence(),buyer='Fund '+str(i)+'x'*170) for i in range(30)]
   msg={'text':s.entry_reference_text(stock,'Monthly',[(z,items)])}
-  self.assertIn('NOT Entry Ready',msg['text']);self.assertIn('SL boundary INR 95.00',msg['text']);self.assertIn('1:2 125.00',msg['text']);self.assertIn('Buffers, risk sizing',msg['text']);self.assertIn('HTF support:',msg['text']);self.assertNotIn('HTF achievement:',msg['text']);self.assertLessEqual(len(msg['text']),4096)
+  self.assertIn('NOT Entry Ready',msg['text']);self.assertIn('SL boundary INR 95.00',msg['text']);self.assertIn('1:2 125.00',msg['text']);self.assertIn('Unbuffered references',msg['text']);self.assertIn('HTF support:',msg['text']);self.assertNotIn('HTF achievement:',msg['text']);self.assertLessEqual(len(msg['text']),4096)
   other=s.entry_reference_text(stock,'Quarterly',[(dict(z,tf='Quarterly'),items)])
   self.assertNotIn('105.00',other)
 
@@ -450,7 +450,7 @@ class SeparateEntryAlertTests(unittest.TestCase):
   self.queue(state,stock,matched);self.assertEqual([p['kind'] for p in state['pending']],['combined_entry_setup'])
   item=state['pending'].pop();state['delivered'].append(item['id']);stock['cmp']=101;ref['scoreComponents']={'score':999}
   self.queue(state,stock,matched);self.assertEqual(state['pending'],[])
-  self.assertIn('NOT Entry Ready',item['text']);self.assertIn('SL boundary INR 95.00',item['text']);self.assertIn('https://scanx.trade/',item['text'])
+  self.assertIn('NOT Entry Ready',item['text']);self.assertIn('SL boundary INR 95.00',item['text']);self.assertNotIn('https://',item['text'])
  def test_status_progression_once_and_entry_survives_migration(self):
   stock,matched,ref=self.fixture();state={'records':{},'pending':[],'delivered':[s.match_identity(stock['symbol'],matched)]}
   for status in ('WAIT_SUPPLY_CLOSE','WAIT_RETEST','REVIEW_REQUIRED'):
@@ -532,5 +532,16 @@ class CombinedEntryAlertTests(unittest.TestCase):
   text=s.combined_entry_alert(stock,matched)['text'];self.assertNotIn('Alternative:',text)
   ref['parentD']=200;ref['parentP']=220;matched[0][0].update(d=200,p=220)
   stock['zones']=[];stock['entry_references']=[ref];self.assertIsNone(s.combined_entry_alert(stock,matched))
+
+class TelegramFormatTests(unittest.TestCase):
+ def test_queued_links_removed_without_changing_sources(self):
+  text='Stock TEST\nhttps://example.com/source\nStudy only'
+  self.assertEqual(s.telegram_text(text),'Stock TEST\nStudy only')
+ def test_multiple_funds_in_one_stock_message(self):
+  f=AlertUpgradeTests();items=[dict(f.evidence(),buyer='AMC '+str(i)) for i in range(8)]
+  stock=f.stock();matched=[(f.zone(),items)];identity=s.match_identity(stock['symbol'],matched)
+  alert=s.timeframe_alert(stock,'Monthly',matched,matched)
+  self.assertEqual(alert['id'],identity);self.assertNotIn('https://',alert['text'])
+  self.assertLess(len(alert['text']),1600);self.assertEqual(items[0]['source'],'https://scanx.trade/')
 
 if __name__=='__main__':unittest.main()

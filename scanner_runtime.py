@@ -482,7 +482,7 @@ def entry_reference_text(stock,tf,group):
             for keypoint in r.get('achievementKeypoints',[])[:2]:lines.append(f"HTF support: {keypoint['tf']} proximal {keypoint['proximal']:.2f} inside entry range | formed {keypoint['date']}")
             if r.get('supplyClose'):lines.append('Completed supply close observed '+r['supplyClose']['date'][:10])
             if r.get('retestDate'):lines.append('Retest observed '+r['retestDate'][:10])
-    lines.append('Buffers, risk sizing, proper-fall / marking and achievement review pending. Targets exclude costs and slippage.')
+    lines.append('Unbuffered references; chart/risk review required. Targets exclude costs/slippage.')
     return '\n'.join(lines)
 
 def timeframe_alert(stock,tf,group,all_matches):
@@ -557,12 +557,12 @@ def combined_entry_alert(stock,matched):
     if len(groups)>1:lines.append(f"Common demand overlap: {max(z['d'] for z in parents):.2f}–{min(z['p'] for z in parents):.2f}")
     lines.append('Buying evidence matched to: '+', '.join(TIMEFRAME_CODES[t] for t in timeframe_groups(matched))+'. Other HTF bands are price support, not separate buying proof.')
     lines.append('Best qualified path: '+tf+' demand → '+r['trendTF']+' Up → '+r['entryTF']+' entry')
-    lines.append('Selection: HTF proximal-support count, entry achievement, closing, then relative distance and width. Seven-star is optional; ranking does not predict returns.')
+    lines.append('Ranking: HTF support → achievement → closing. Seven-star optional.')
     lines.append(entry_reference_text(dict(stock,entry_references=[r]),tf,[(parent,proof.get(key(parent),[]))]))
     for item in options[1:4]:
         alt=item['reference']
         lines.append(f"Alternative: {alt['parentTF']} → {alt['trendTF']} Up → {alt['entryTF']} demand {alt['distal']:.2f}–{alt['proximal']:.2f} | achievement {alt['achievement']} | {alt['status']}")
-    lines.append('Each path passed its own curve, trend, HTF support and entry-achievement gates. No conditions borrowed from another path.')
+
     prefix='\n'.join(lines)+'\n\n'
     text=prefix+alert_text(stock,matched,budget=max(800,4000-len(prefix)),include_zones=False)
     if len(text)>4096:raise ValueError('Combined entry message exceeds Telegram limit')
@@ -667,9 +667,9 @@ def alert_text(stock,matched,budget=3950,include_zones=True):
     buyers={}
     for z,items in matched:
         position=100*(stock['cmp']-z['d'])/(z['p']-z['d']) if z['p']>z['d'] else 0
-        if include_zones:lines.append(f"{z['tf']} demand {z['d']:.2f}–{z['p']:.2f} | formed {z['date']} | {'First return' if z['firstReturn'] else 'Tested context'} | visits {z.get('testEpisodes','unknown')} | position {position:.0f}% from distal | visit {z.get('latestTouch')}")
+        if include_zones:lines.append(f"{z['tf']} demand {z['d']:.2f}–{z['p']:.2f} | formed {z['date']} | {'First return' if z['firstReturn'] else 'Tested context'} | visits {z.get('testEpisodes','unknown')}")
         for item in items:buyers[evidence_identity(item)]=item
-    footer='Monthly MF holding changes are not confirmed same-day buys. Splits and other non-trade changes may affect holdings.\nDemand Lab v31 OHLC bands. Research match; entry confirmation required. Public quotes may be delayed.'
+    footer='Monthly MF holding changes are not confirmed same-day buys.\nPersonal study only; not a buy/sell recommendation. Data may be delayed; market risk applies.'
     shown=0
     for e in display_evidence(list(buyers.values())):
         measure='Shares '+str(e.get('qty','not provided'))
@@ -678,19 +678,24 @@ def alert_text(stock,matched,budget=3950,include_zones=True):
         block=[evidence_label(e),str(e['buyer'])[:180],e['start']+' → '+e['end']+' | '+measure]
         if e.get('date_basis')=='NSE transaction period':block.extend([e['mode'],'Published '+e['reported_at']])
         elif 'amc_id' not in e:block.append('Date basis: '+e.get('date_basis','Source trade date'))
-        block.append(e['source']);text='\n'.join(block)
-        if shown>=5 or len('\n'.join(lines))+len(text)+len(footer)+180>budget:break
+        text='\n'.join(block)
+        if shown>=3 or len('\n'.join(lines))+len(text)+len(footer)+180>budget:break
         lines.append(text);shown+=1
     if len(buyers)>shown:lines.append(str(len(buyers)-shown)+' additional qualifying records retained in scan state.')
     lines.append(footer)
     return '\n'.join(lines)
+
+def telegram_text(text):
+    """Source references stay in evidence; private Telegram gets no URLs."""
+    text=re.sub(r'https?://\S+', '', text)
+    return '\n'.join(line.rstrip() for line in text.splitlines() if line.strip())
 
 def deliver_pending(store,destination,limit=100):
     if verify_private_destination()!=destination:raise ValueError('Private destination changed during delivery')
     state=store.state;sent=0
     while state['pending'] and sent<limit:
         item=state['pending'][0]
-        response=json.loads(request('https://api.telegram.org/bot'+os.environ['BOT_TOKEN'].strip()+'/sendMessage',{'chat_id':os.environ['CHAT_ID'].strip(),'text':item['text'],'link_preview_options':{'is_disabled':True}}))
+        response=json.loads(request('https://api.telegram.org/bot'+os.environ['BOT_TOKEN'].strip()+'/sendMessage',{'chat_id':os.environ['CHAT_ID'].strip(),'text':telegram_text(item['text']),'link_preview_options':{'is_disabled':True}}))
         if not response.get('ok'):raise ValueError('Telegram delivery rejected')
         state['delivered'].append(item['id']);remember_watches(state,item.get('watches',[]));state['pending'].pop(0);store.save();sent+=1;time.sleep(1.1)
     if sent:print('PRIVATE DELIVERY',sent,'queued alerts delivered; waiting',len(state['pending']),flush=True)

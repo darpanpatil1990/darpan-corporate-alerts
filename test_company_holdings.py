@@ -42,6 +42,12 @@ class OwnershipTests(unittest.TestCase):
         self.assertEqual(result['period'],'Sep 2026')
         self.assertEqual(result['holdings']['DIIs']['change_pp'],'0.16')
 
+    def test_unfinished_quarter_month_is_not_a_completed_quarter(self):
+        html=HTML.replace('<th>Sep 2026</th>','<th>Sep 2026</th><th>Dec 2026</th>')
+        html=html.replace('9.01%</td>','9.01%</td><td>99.00%</td>').replace('13.57%</td>','13.57%</td><td>0.00%</td>')
+        result=parse_company(html,'TEST',date(2026,12,15))
+        self.assertEqual(result['period'],'Sep 2026')
+
     def test_constituent_validation(self):
         csv = 'Symbol\n' + '\n'.join('STOCK' + str(i) for i in range(500))
         self.assertEqual(len(universe_from_csv(csv)), 500)

@@ -1,5 +1,6 @@
 """Dated company-level ownership changes; never equate holdings with trades."""
 import base64
+import calendar
 import csv
 import hashlib
 import io
@@ -114,6 +115,8 @@ def parse_company(html, symbol, today=None):
         if dt.month not in (3, 6, 9, 12):
             # Sources can append an interim month after the last completed quarter.
             # Do not relabel that observation as quarterly or discard valid quarters.
+            continue
+        if dt.replace(day=calendar.monthrange(dt.year,dt.month)[1]) > today:
             continue
         dated.append((dt, i, label))
     if len(dated) < 2 or len({d[0] for d in dated}) != len(dated):

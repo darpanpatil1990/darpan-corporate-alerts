@@ -164,7 +164,7 @@ jobs:
         \ in refs:\n            digest=ref.get('hash','')\n            path=ref.get('path','')\n            if not\
         \ re.fullmatch(r'[a-f0-9]{64}',digest) or path!=STATE_PATH+'.seen/'+digest+'.json':\n                raise\
         \ RuntimeError('Invalid history shard identity')\n            endpoint=self.endpoint.rsplit('/contents/',1)[0]+'/contents/'+path\n\
-        \            result=self.api(endpoint+'?ref='+url.quote(self.branch,safe=''))\n            payload=base64.b64decode(result['content'],validate=True)\n\
+        \            result=self.api(endpoint+'?ref='+url.quote(self.branch,safe=''))\n            payload=base64.b64decode(''.join(result['content'].split()),validate=True)\n\
         \            if hashlib.sha256(payload).hexdigest()!=digest:\n                raise RuntimeError('History\
         \ shard checksum mismatch')\n            chunk=decode_state(payload)\n            if chunk.get('version')!=1\
         \ or not isinstance(chunk.get('seen'),dict) or len(chunk['seen'])!=ref['count']:\n                raise\
@@ -176,10 +176,10 @@ jobs:
         \        payload=encode_state({'version':1,'seen':seen})\n        digest=hashlib.sha256(payload).hexdigest()\n\
         \        path=STATE_PATH+'.seen/'+digest+'.json'\n        endpoint=self.endpoint.rsplit('/contents/',1)[0]+'/contents/'+path\n\
         \        try:\n            result=self.api(endpoint+'?ref='+url.quote(self.branch,safe=''))\n          \
-        \  if base64.b64decode(result['content'],validate=True)!=payload:\n                raise RuntimeError('Immutable\
-        \ history shard changed')\n        except urllib.error.HTTPError as error:\n            if error.code!=404:raise\n\
-        \            self.api(endpoint,{'message':'Preserve alert history shard','branch':self.branch,\n       \
-        \                        'content':base64.b64encode(payload).decode()})\n        return {'path':path,'hash':digest,'count':len(seen)}\n\
+        \  if base64.b64decode(''.join(result['content'].split()),validate=True)!=payload:\n                raise\
+        \ RuntimeError('Immutable history shard changed')\n        except urllib.error.HTTPError as error:\n   \
+        \         if error.code!=404:raise\n            self.api(endpoint,{'message':'Preserve alert history shard','branch':self.branch,\n\
+        \                               'content':base64.b64encode(payload).decode()})\n        return {'path':path,'hash':digest,'count':len(seen)}\n\
         \n\n    def save(self):\n        # Persist immutable history chunks first and atomically point the root\
         \ to them last.\n        # Any failure leaves the preceding complete root readable; no history/queue is\
         \ reset.\n        archived=dict(getattr(self,'archived_seen',{}))\n        refs=list(getattr(self,'seen_archives',[]))\n\

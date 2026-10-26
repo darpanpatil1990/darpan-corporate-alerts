@@ -1,0 +1,38 @@
+name: Sector Rotation Private Alerts
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 13 * * 1-5'
+permissions:
+  contents: write
+concurrency:
+  group: sector-rotation-private
+  cancel-in-progress: false
+jobs:
+  rotation:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache/restore@v4
+        with:
+          path: .sector-rotation-cache
+          key: sector-rotation-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: sector-rotation-${{ runner.os }}-
+      - name: Install shared private destination verifier dependency
+        run: pip install beautifulsoup4==4.14.3
+      - name: Verify rotation calculations and delivery queue
+        run: python -m unittest test_sector_rotation.py
+      - name: Calculate sectors and send independent private summary
+        run: python sector_rotation.py
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.INSTITUTIONAL_PRIVATE_CHAT_ID }}
+      - name: Preserve official index history
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .sector-rotation-cache
+          key: sector-rotation-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}

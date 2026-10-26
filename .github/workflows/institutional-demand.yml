@@ -22,7 +22,7 @@ jobs:
           key: scanner-history-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: scanner-history-${{ runner.os }}-
       - name: Install parsers
-        run: pip install beautifulsoup4==4.14.3 openpyxl==3.1.5 xlrd==2.0.2
+        run: pip install beautifulsoup4==4.14.3 openpyxl==3.1.5 xlrd==2.0.2 cryptography==50.0.2
       - name: Verify evidence matching
         run: python -m unittest test_institutional_confluence.py test_company_holdings.py test_scanner_runtime.py
       - name: Scan and deliver dated confluence alerts
@@ -34,6 +34,14 @@ jobs:
           SCREENER_EMAIL: ${{ secrets.SCREENER_EMAIL }}
           SCREENER_PASSWORD: ${{ secrets.SCREENER_PASSWORD }}
           SCANNER_WORKERS: '6'
+
+      - name: Darpan Personal STUDY combined private follow-up
+        if: ${{ !cancelled() }}
+        run: python -m unittest test_personal_study.py && python personal_study.py
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.INSTITUTIONAL_PRIVATE_CHAT_ID }}
 
       - name: Preserve public source cache
         if: always()

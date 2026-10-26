@@ -10,6 +10,7 @@ import io
 import json
 import math
 import os
+import re
 import statistics
 import sys
 import time
@@ -18,6 +19,8 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
+from decimal import Decimal
+from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 IST = ZoneInfo('Asia/Kolkata')
@@ -31,6 +34,136 @@ SECTORS = ('Nifty Auto','Nifty Bank','Nifty Financial Services','Nifty FMCG',
            'Nifty Hospitals','Nifty Insurance','Nifty Power','Nifty Retail',
            'Nifty Consumer Services','Nifty Capital Goods','Nifty Telecommunications')
 CORE = {'Nifty Auto','Nifty Bank','Nifty FMCG','Nifty IT','Nifty Metal','Nifty Pharma'}
+
+
+def constituent_members(raw):
+    rows = list(csv.DictReader(io.StringIO(raw.lstrip('\ufeff'))))
+    members = {}
+    for row in rows:
+        symbol, isin = row['Symbol'].strip(), row['ISIN Code'].strip()
+        if symbol.startswith('DUMMY'):
+            continue
+        if row.get('Series','').strip() != 'EQ':
+            continue
+        if not re.fullmatch(r'[A-Z0-9&_.-]+',symbol) or not re.fullmatch(r'IN[A-Z0-9]{10}',isin):
+            raise ValueError('Constituent identity invalid')
+        if isin in members or symbol in members.values():
+            raise ValueError('Duplicate constituent identity')
+        members[isin] = symbol
+    if not members:
+        raise ValueError('No equity constituents found')
+    return members
+
+
+def eligible_stocks(sector_members, universe, caps):
+    """Join by stock ISIN, never infer membership or cap from company names."""
+    selected, missing, excluded = [], [], 0
+    for isin in sorted(set(sector_members) & set(universe)):
+        symbol = universe[isin]
+        cap = caps.get(symbol)
+        if not cap or cap.get('stock_isin') != isin:
+            missing.append(symbol)
+            continue
+        amount = Decimal(str(cap['cap']))
+        if not amount.is_finite() or amount <= 0:
+            missing.append(symbol)
+        elif amount > 500:
+            selected.append(symbol)
+        else:
+            excluded += 1
+    return {'stocks':sorted(selected),'cap_unavailable':sorted(missing),'cap_excluded':excluded}
+
+
+def sector_page(name):
+    slug = {'Nifty Healthcare Index':'nifty-healthcare-index',
+            'Nifty Oil & Gas':'nifty-oil-and-gas-index',
+            'Nifty Consumer Durables':'nifty-consumer-durables-index'}.get(name,name.lower().replace(' ','-'))
+    category = 'thematic-indices' if name == 'Nifty Capital Markets' else 'sectoral-indices'
+    return 'https://www.niftyindices.com/indices/equity/'+category+'/'+slug
+
+
+def load_related(results):
+    from bs4 import BeautifulSoup
+    from scanner_runtime import read_bytes, load_scanx_caps, UNIVERSE_URL
+    universe = constituent_members(read_bytes(UNIVERSE_URL).decode('utf-8-sig'))
+    if not 450 <= len(universe) <= 550:
+        raise ValueError('Nifty 500 constituent count invalid')
+    caps, _ = load_scanx_caps({symbol:isin for isin,symbol in universe.items()})
+    active = [name for name,r in results.items() if r['group'] != 'Unavailable']
+    def fetch(name):
+        page = sector_page(name)
+        soup = BeautifulSoup(read_bytes(page),'html.parser')
+        links = {urljoin(page,a['href']) for a in soup.select('a[href]')
+                 if 'index constituent' in a.get_text(' ',strip=True).casefold()
+                 and a['href'].lower().endswith('.csv')}
+        if len(links) != 1:
+            raise ValueError('Official sector constituent link ambiguous')
+        link = links.pop()
+        parsed = urlparse(link)
+        normalized_path = '/'+parsed.path.lstrip('/')
+        if parsed.hostname not in ('www.niftyindices.com','niftyindices.com') or not normalized_path.startswith('/IndexConstituent/'):
+            raise ValueError('Unexpected constituent source')
+        archive = 'https://nsearchives.nseindia.com/content/indices/'+parsed.path.rsplit('/',1)[-1]
+        source = archive
+        try:
+            raw = read_bytes(archive)
+        except urllib.error.HTTPError as error:
+            if error.code not in (404,410):
+                raise
+            source = 'https://www.niftyindices.com'+normalized_path
+            raw = read_bytes(source)
+        members = constituent_members(raw.decode('utf-8-sig'))
+        return name,dict(eligible_stocks(members,universe,caps),source=source)
+    related, failures = {}, []
+    def safe_fetch(name):
+        try:
+            return fetch(name)
+        except (OSError,ValueError,KeyError) as error:
+            print('RELATED SOURCE UNAVAILABLE | '+name+' | '+type(error).__name__,flush=True)
+            return name,{'unavailable':type(error).__name__}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for name,value in pool.map(safe_fetch,active):
+            related[name] = value
+            if 'unavailable' in value:
+                failures.append(name)
+    print(f'RELATED STOCK COVERAGE | Sectors: {len(active)-len(failures)}/{len(active)} | Universe: {len(universe)} | Exact market caps: {len(caps)}')
+    return related
+
+
+def related_messages(results, related, week, checked):
+    messages = []
+    for group, icon in [('Leading','🟢'),('Improving','🔵'),('Weakening','🟠'),('Lagging','🔴'),('Boundary','⚪')]:
+        names = [name for name,r in results.items() if r['group']==group]
+        if not names:
+            continue
+        header = f'Darpan | SECTOR RELATED STOCKS\n{icon} Sector group: {group}\nRotation week: {week} | Constituents/caps checked: {checked}\nFilter: current NIFTY 500 equities (EQ); market cap strictly > ₹500 Cr.\n'
+        footer = '\nAlphabetical constituent list, not stock RS ranking or a Buy signal. Stock HTF, achievement and institutional evidence remain separate. Source: official NSE membership; ScanX market caps.'
+        parts, body = [], ''
+        for name in names:
+            item = related.get(name,{'unavailable':'missing'})
+            label = name.removeprefix('Nifty ')
+            if 'unavailable' in item:
+                line = label+': constituent source unavailable; no stocks inferred.\n'
+            else:
+                line = label+f" ({len(item['stocks'])}): "+(', '.join(item['stocks']) or 'None eligible')
+                if item['cap_unavailable']:
+                    line += ' | Cap unavailable, omitted: '+', '.join(item['cap_unavailable'])
+                if item['cap_excluded']:
+                    line += f" | Cap ≤500 Cr excluded: {item['cap_excluded']}"
+                line += '\n'
+            if len(header+body+line+footer) > 3500:
+                if not body or len(header+line+footer) > 3500:
+                    raise ValueError('Sector stock list exceeds message budget')
+                parts.append(body)
+                body = ''
+            body += line
+        if body:
+            parts.append(body)
+        for i,part in enumerate(parts):
+            # Check timestamps and harmless cap ticks do not trigger duplicates.
+            identity = hashlib.sha256(json.dumps(['related-stocks-v1',week,group,i,part],ensure_ascii=False).encode()).hexdigest()
+            messages.append((identity,header+part+footer))
+    return messages
 
 
 def completed_friday(now):
@@ -190,6 +323,10 @@ def main():
         weeks = list(pool.map(lambda d:fetch_week(d,cache),dates))
     text, results = report(weeks)
     print(text)
+    related = load_related(results)
+    stock_messages = related_messages(results,related,friday.isoformat(),datetime.now(IST).isoformat(timespec='minutes'))
+    for _,message in stock_messages:
+        print(message)
     if '--dry-run' in sys.argv:
         return
     from institutional_confluence import Store, verify_private_destination, request
@@ -202,6 +339,8 @@ def main():
         return json.loads(request('https://api.telegram.org/bot'+os.environ['BOT_TOKEN'].strip()+'/sendMessage',
                                   {'chat_id':os.environ['CHAT_ID'].strip(),'text':message,'disable_web_page_preview':True}))
     sent = deliver(store,text,identity,destination,send)
+    for stock_identity,message in stock_messages:
+        sent += deliver(store,message,stock_identity,destination,send)
     print(f'SECTOR ROTATION SUCCESS | Sent: {sent} | Waiting: {len(store.state["pending"])}')
 
 

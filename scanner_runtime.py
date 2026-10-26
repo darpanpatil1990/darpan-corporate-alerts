@@ -22,7 +22,10 @@ CAP_API='https://ow-scanx-analytics.dhan.co/customscan/fetchdt'
 CAP_LOOKUP={}
 OFFICIAL_NSE={}
 # Yahoo search identifies this NSE REIT series explicitly; bind the alias to its stock ISIN.
-YAHOO_QUOTE_ALIASES={'BAGMANE':('INE2OVN25015','BAGMANE-RR')}
+YAHOO_QUOTE_ALIASES={'BAGMANE':('INE2OVN25015','BAGMANE-RR'),
+    # NSE/CML/76967: same company renamed effective 23-Oct-2026.
+    # Keep the established historical series, joined only through the verified stock ISIN.
+    'ICICILIFE':('INE726G01019','ICICIPRULI')}
 AMC_API='https://ow-static-scanx.dhan.co/staticscanx/amclist_v2'
 ROOT=Path(__file__).resolve().parent
 CACHE=ROOT/'.scanner-cache'

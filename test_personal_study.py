@@ -55,7 +55,7 @@ class PersonalStudyTests(unittest.TestCase):
         self.assertTrue(item['text'].startswith('Darpan Personal STUDY\n'))
         self.assertTrue(item['text'].endswith(p.DISCLAIMER))
         self.assertLessEqual(len(item['text']),4096)
-        self.assertIn('ARS / SRS / EPS: Unavailable',item['text'])
+        self.assertIn('Quarterly EPS: Unavailable',item['text'])
         stock['entry_references'][0]['achievement']=0
         self.assertIsNone(p.study_alert(stock,None,now,'RS positive'))
 
@@ -67,6 +67,29 @@ class PersonalStudyTests(unittest.TestCase):
         self.assertEqual(one['id'],two['id'])
         stock['market_cap_cr']='500'
         self.assertIsNone(p.study_alert(stock,None,now,'RS +2'))
+
+    def test_rs55_srs123_anchor_and_fresh_joint_cross(self):
+        days=[f'2024-{i:03d}' for i in range(150)]
+        benchmark={d:100+i for i,d in enumerate(days)}
+        stock={d:2*v for d,v in benchmark.items()}
+        result=p.rs_study_values(stock,benchmark,days[-1],anchor=days[0])
+        self.assertAlmostEqual(result['srs123'],0)
+        stock[days[-1]]*=1.1
+        result=p.rs_study_values(stock,benchmark,days[-1],anchor=days[0])
+        self.assertAlmostEqual(result['srs123'],10)
+        self.assertAlmostEqual(result['ars'],10)
+        self.assertTrue(result['fresh_joint_cross'])
+        del stock[days[-3]]
+        self.assertIsNone(p.rs_study_values(stock,benchmark,days[-1],anchor=days[0])['srs123'])
+
+    def test_eps_exact_quarter_yoy_turnaround_and_identity(self):
+        html='<a href="https://www.nseindia.com/">NSE: TEST</a><section id="quarters"><table><thead><tr><th></th><th>Sep 2025</th><th>Jun 2026</th><th>Sep 2026</th></tr></thead><tbody><tr><td>EPS in Rs</td><td>2.00</td><td>2.50</td><td>3.00</td></tr></tbody></table></section>'
+        result=p.eps_from_html(html,'TEST',datetime(2026,10,26).date())
+        self.assertEqual(result['quarter'],'2026-09-30')
+        self.assertEqual(result['comparison'],'YoY +50.00%')
+        result=p.eps_from_html(html.replace('>2.00<','>-2.00<'),'TEST',datetime(2026,10,26).date())
+        self.assertEqual(result['comparison'],'Loss → profit turnaround')
+        with self.assertRaises(ValueError):p.eps_from_html(html,'OTHER',datetime(2026,10,26).date())
 
 
 if __name__=='__main__':unittest.main()

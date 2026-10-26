@@ -16,7 +16,7 @@ from pathlib import Path
 
 from bs4 import BeautifulSoup
 
-UNIVERSE_URL = 'https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv'
+UNIVERSE_URL = 'https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv'
 STATE_PATH = 'company-holdings-state.json'
 
 
@@ -112,7 +112,9 @@ def parse_company(html, symbol, today=None):
             continue
         dt = datetime.strptime(label, '%b %Y').date()
         if dt.month not in (3, 6, 9, 12):
-            raise ValueError('Non-quarterly holding period')
+            # Sources can append an interim month after the last completed quarter.
+            # Do not relabel that observation as quarterly or discard valid quarters.
+            continue
         dated.append((dt, i, label))
     if len(dated) < 2 or len({d[0] for d in dated}) != len(dated):
         raise ValueError('Comparable shareholding periods missing')
@@ -197,7 +199,12 @@ class Store:
 
 def main():
     dry_run = '--dry-run' in __import__('sys').argv
-    symbols = [s for s in universe_from_csv(request(UNIVERSE_URL)) if not s.startswith('DUMMY')]
+    raw_universe = request(UNIVERSE_URL)
+    all_symbols = universe_from_csv(raw_universe)
+    rows = list(csv.DictReader(io.StringIO(raw_universe)))
+    omitted = {r['Symbol'].strip(): 'Non-equity series; quarterly equity ownership source not supported'
+               for r in rows if r.get('Series') and r['Series'].strip() != 'EQ'}
+    symbols = [s for s in all_symbols if not s.startswith('DUMMY') and s not in omitted]
     limit = min(50, max(1, int(os.environ.get('HOLDINGS_BATCH_SIZE', '25'))))
     if dry_run:
         state = {'cursor': 0, 'records': {}, 'pending': [], 'delivered': []}
@@ -244,6 +251,7 @@ def main():
     state['retry_symbols'] = list(dict.fromkeys([s for s in retries if s not in batch] + failed))
     state['universe_checked_at'] = datetime.now(timezone.utc).isoformat()
     state['universe_source'] = UNIVERSE_URL
+    state['scope_exclusions'] = omitted
     state['last_batch'] = {'checked': checked, 'failed': failed, 'matching': [r['symbol'] for r in matches]}
     sent = 0
     if store:
@@ -267,6 +275,7 @@ def main():
             f.write('## Company-level quarterly ownership\n\n' + summary + '\n\n')
             f.write('Screener source; Nifty 500 and market cap > INR 500 crore. Rolling batches; this is not a full-universe result per run. Failed symbols are retried on the next sweep.\n\n')
             f.write('Quarterly ownership changes are not daily trades. DII is not synonymous with mutual funds. Monthly MF portfolio buys and demand zones remain separate.\n\n')
+            for symbol,reason in omitted.items():f.write('- OUTSIDE EQUITY OWNERSHIP SCOPE '+symbol+': '+reason+'\n')
             for record in matches:
                 f.write('- ' + record['symbol'] + ' | ' + record['previous_period'] + ' → ' + record['period'] + ' | ' + record['source'] + '\n')
     if failed:

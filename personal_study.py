@@ -8,16 +8,20 @@ import base64
 import json
 import math
 import os
+import re
 import sys
 from datetime import datetime
 from decimal import Decimal
 from urllib.parse import quote
+import calendar
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from scanner_runtime import (CompactStore, combined_entry_alert, alert_text, read_bytes,
                              request, verify_private_destination, IST)
 from institutional_confluence import Store
 from sector_rotation import completed_friday
+
+ARS_ANCHOR='2024-05-10'  # Explicit historical public reference, not claimed as the latest official anchor.
 
 DISCLAIMER = ('⚠️ Disclaimer: This alert is for educational and research purposes only and is not a recommendation to buy or sell. '
               'Demand zones, institutional evidence, and sector strength do not guarantee future returns. '
@@ -121,25 +125,104 @@ def relative_returns(stock, benchmark, asof):
     return result
 
 
-def strength_context(stock, benchmark_raw):
+def rs_study_values(stock,benchmark,asof,anchor=ARS_ANCHOR):
+    dates=sorted(benchmark)
+    def value(n,offset=0):
+        end=len(dates)-1-offset
+        if end<n:return None
+        span=dates[end-n:end+1]
+        if len(span)!=n+1 or any(d not in stock for d in span):return None
+        return 100*((stock[span[-1]]/stock[span[0]])/(benchmark[span[-1]]/benchmark[span[0]])-1)
+    if not dates or dates[-1]!=asof:raise ValueError('RS study session mismatch')
+    ars=None;prior_ars=None
+    if anchor in stock and anchor in benchmark and asof in stock:
+        ars=100*((stock[asof]/stock[anchor])/(benchmark[asof]/benchmark[anchor])-1)
+        if len(dates)>1 and dates[-2] in stock:
+            prior_ars=100*((stock[dates[-2]]/stock[anchor])/(benchmark[dates[-2]]/benchmark[anchor])-1)
+    srs=value(123);prior_srs=value(123,1)
+    fresh=None if any(v is None for v in (ars,srs,prior_ars,prior_srs)) else ars>0 and srs>0 and not(prior_ars>0 and prior_srs>0)
+    return {'rs55':value(55),'srs123':srs,'ars':ars,'fresh_joint_cross':fresh}
+
+
+def eps_from_html(raw,symbol,today):
+    from bs4 import BeautifulSoup
+    soup=BeautifulSoup(raw,'html.parser')
+    names=[re.sub(r'\s+','',a.get_text(' ',strip=True)) for a in soup.select('a[href]')]
+    if 'NSE:'+symbol not in names:raise ValueError('EPS company identity mismatch')
+    table=soup.select_one('#quarters table')
+    if table is None:raise ValueError('Quarterly EPS table unavailable')
+    headers=table.select('thead tr th');periods=[]
+    for i,cell in enumerate(headers):
+        if i==0:continue
+        text=cell.get_text(' ',strip=True)
+        try:dt=datetime.strptime(text,'%b %Y').date()
+        except ValueError:continue
+        end=dt.replace(day=calendar.monthrange(dt.year,dt.month)[1])
+        if dt.month in (3,6,9,12) and end<=today:periods.append((end,i))
+    rows=[]
+    for row in table.select('tbody tr'):
+        cells=row.find_all(['th','td'],recursive=False)
+        if cells and re.sub(r'\s+','',cells[0].get_text()).casefold() in ('epsinrs','epsinrs.','eps₹','eps'):
+            rows.append(cells)
+    if len(rows)!=1:raise ValueError('Quarterly EPS row ambiguous/missing')
+    values={}
+    for dt,i in periods:
+        text=rows[0][i].get_text(' ',strip=True).replace(',','')
+        if not re.fullmatch(r'-?\d+(?:\.\d+)?',text):continue
+        if dt in values:raise ValueError('Duplicate EPS period')
+        values[dt]=Decimal(text)
+    if not values:raise ValueError('EPS data unavailable')
+    latest=max(values)
+    if (today-latest).days>190:raise ValueError('EPS quarter stale')
+    prior=latest.replace(year=latest.year-1)
+    current,previous=values[latest],values.get(prior)
+    if previous is None:status='YoY unavailable'
+    elif previous>0:status=f'YoY {(current/previous-1)*100:+.2f}%'
+    elif previous<0 and current>0:status='Loss → profit turnaround'
+    elif previous<current<0:status='Loss reducing; still loss-making'
+    else:status='YoY % not meaningful (non-positive prior EPS)'
+    return {'quarter':latest.isoformat(),'eps':str(current),'comparison':status}
+
+
+def eps_context(stock,now):
+    source='https://www.screener.in/company/'+quote(stock['symbol'],safe='')+'/consolidated/'
+    try:raw=read_bytes(source)
+    except Exception as error:
+        if getattr(error,'code',None)!=404:raise
+        source=source.replace('/consolidated/','/')
+        raw=read_bytes(source)
+    result=eps_from_html(raw,stock['symbol'],now.date())
+    return ('Quarterly EPS (reported): INR '+result['eps']+' | '+result['quarter']+' | '+result['comparison']+
+            '\nEPS observed '+now.date().isoformat()+'; historical availability not inferred.\n'+source+'#quarters')
+
+
+def strength_context(stock, benchmark_raw, nifty50_raw=None):
     ticker=stock['quality'].get('data_symbol',stock['symbol'])+'.NS'
     if stock['quality'].get('exchange','NSE')!='NSE':
         return 'Stock strength: Unavailable (separate exchange history)'
     asof=stock['quality']['completed_asof']
     stem='https://query1.finance.yahoo.com/v8/finance/chart/'
-    raw=json.loads(read_bytes(stem+quote(ticker,safe='')+'?interval=1d&range=1y'))
+    raw=json.loads(read_bytes(stem+quote(ticker,safe='')+'?interval=1d&range=5y'))
     closes=daily_closes(raw,ticker,asof)
     benchmark=daily_closes(benchmark_raw,'^CRSLDX',asof)
     # An official final close must agree before mixing these source histories.
     if stock['quality']['quote']['kind']=='NSE official final close' and abs(closes[asof]/stock['cmp']-1)>0.001:
         raise ValueError('Stock RS close disagrees with verified NSE close')
     values=relative_returns(closes,benchmark,asof)
-    return ('Stock relative return vs NIFTY 500 | '+asof+'\n'+
+    text=('Stock relative return vs NIFTY 500 | '+asof+'\n'+
             ' | '.join(k+': '+('Unavailable' if v is None else f'{v:+.2f}%') for k,v in values.items())+
-            '\nPrice-return comparison; Yahoo daily history, not stock/sector RS.')
+            '\nYahoo completed daily price returns; not stock/sector RS.')
+    if nifty50_raw:
+        rs=rs_study_values(closes,daily_closes(nifty50_raw,'^NSEI',asof),asof)
+        display=lambda x:'Unavailable' if x is None else f'{x:+.2f}%'
+        text+='\nRS study vs NIFTY 50 | RS55 '+display(rs['rs55'])+' | SRS123 '+display(rs['srs123'])+' | ARS '+display(rs['ars'])
+        text+='\nARS anchor '+ARS_ANCHOR+' (historical public reference; latest official anchor unconfirmed).'
+        text+='\nFresh joint ARS/SRS positive cross: '+('Unavailable' if rs['fresh_joint_cross'] is None else 'YES' if rs['fresh_joint_cross'] else 'NO')
+    else:text+='\nARS / SRS / RS55: Unavailable (NIFTY 50 source unavailable).'
+    return text
 
 
-def study_alert(stock, snapshot, now, strength):
+def study_alert(stock, snapshot, now, strength,eps='Quarterly EPS: Unavailable'):
     if stock.get('excluded') or not stock['quality'].get('current_alerts_eligible',True):
         return None
     cap=Decimal(str(stock['market_cap_cr']))
@@ -152,8 +235,12 @@ def study_alert(stock, snapshot, now, strength):
     sector,groups=sector_context(stock,snapshot,now)
     entry_prefix=entry['text'].split('\n\nInstitutional evidence + HTF demand',1)[0]
     entry_prefix='\n'.join(entry_prefix.splitlines()[1:])
+    entry_prefix='\n'.join('Ranking: HTF support → achievement → closing → distance/width.' if line.startswith('Selection:') else
+        'Independent path gates passed; no cross-path borrowing.' if line.startswith('Each path passed') else
+        'Unbuffered references; chart/risk review required. Not Entry Ready.' if line.startswith('Buffers, risk sizing') else line
+        for line in entry_prefix.splitlines())
     header=(f"Darpan Personal STUDY\n{stock['symbol']} | NIFTY 500 | Market cap INR {cap:,.0f} Cr\n"+
-            sector+'\n'+strength+'\nARS / SRS / EPS: Unavailable (dashboard feed not linked; no proxy values).\n\n')
+            sector+'\n'+strength+'\n'+eps+'\n\n')
     prefix=header+entry_prefix+'\n\n'
     budget=4096-len(prefix)-len(DISCLAIMER)-4
     if budget < 650:
@@ -163,7 +250,7 @@ def study_alert(stock, snapshot, now, strength):
     if len(text)>4096:
         raise ValueError('Combined study exceeds Telegram limit')
     # Quote ticks and strength changes alone do not create new setup alerts.
-    identity='personal-study-v1:'+hashlib.sha256(json.dumps([entry['id'],groups],sort_keys=True).encode()).hexdigest()
+    identity='personal-study-v2:'+hashlib.sha256(json.dumps([entry['id'],groups,ARS_ANCHOR],sort_keys=True).encode()).hexdigest()
     return {'id':identity,'text':text,'symbol':stock['symbol'],'kind':'personal_study'}
 
 
@@ -188,19 +275,23 @@ def main():
         matched=[(e['zone'],e['evidence']) for e in stock.get('evidence',[])]
         if matched and combined_entry_alert(stock,matched):
             candidates.append(stock)
-    benchmark=None
+    benchmark=None;nifty50=None
     if candidates:
         try:
             benchmark=json.loads(read_bytes('https://query1.finance.yahoo.com/v8/finance/chart/%5ECRSLDX?interval=1d&range=1y'))
         except (OSError,ValueError):
             pass
+        try:nifty50=json.loads(read_bytes('https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI?interval=1d&range=5y'))
+        except (OSError,ValueError):pass
     alerts=[]
     for stock in candidates:
         try:
-            strength=strength_context(stock,benchmark) if benchmark else 'Stock strength: Unavailable (benchmark source unavailable)'
+            strength=strength_context(stock,benchmark,nifty50) if benchmark else 'Stock strength: Unavailable (benchmark source unavailable)'
         except (OSError,ValueError,KeyError,TypeError):
             strength='Stock strength: Unavailable (source/date/identity check failed)'
-        alert=study_alert(stock,snapshot,now,strength)
+        try:eps=eps_context(stock,now)
+        except (OSError,ValueError,KeyError,TypeError):eps='Quarterly EPS: Unavailable (source/identity/period check failed)'
+        alert=study_alert(stock,snapshot,now,strength,eps)
         if alert:
             alerts.append(alert)
             if dry:

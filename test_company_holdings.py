@@ -34,6 +34,14 @@ class OwnershipTests(unittest.TestCase):
     def test_market_cap_boundary_excluded(self):
         self.assertIsNone(self.parse(HTML.replace('1,000', '500')))
 
+    def test_interim_month_does_not_replace_quarter_or_break_comparison(self):
+        html=HTML.replace('<th>Sep 2026</th>','<th>Sep 2026</th><th>Oct 2026</th>')
+        html=html.replace('9.01%</td>','9.01%</td><td>99.00%</td>').replace('13.57%</td>','13.57%</td><td>0.00%</td>')
+        result=self.parse(html)
+        self.assertEqual(result['previous_period'],'Jun 2026')
+        self.assertEqual(result['period'],'Sep 2026')
+        self.assertEqual(result['holdings']['DIIs']['change_pp'],'0.16')
+
     def test_constituent_validation(self):
         csv = 'Symbol\n' + '\n'.join('STOCK' + str(i) for i in range(500))
         self.assertEqual(len(universe_from_csv(csv)), 500)

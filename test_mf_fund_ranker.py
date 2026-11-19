@@ -90,6 +90,43 @@ class MutualFundRankerTests(unittest.TestCase):
                            json.dumps(raw).encode())).decode()}))
             self.assertEqual(m.read_state(p), raw)
 
+
+    def test_monthly_change_types_are_not_confused_with_returns(self):
+        for prev,current,expected in [
+            (100,120,'INCREASED'),(120,100,'REDUCED'),
+            (100,100,'UNCHANGED'),(0,100,'NEW_POSITION'),(100,0,'EXITED')
+        ]:
+            with self.subTest(expected=expected):
+                data=sample(shares=f'{current}|{current}|{prev}')
+                rows,_=m.parse_page(data,'INE000000001',date(2026,11,19))
+                self.assertEqual(rows[0]['change_type'],expected)
+                self.assertEqual(float(rows[0]['change_qty']),current-prev)
+
+    def test_exit_counted_as_activity_not_current_portfolio_stock(self):
+        now=date(2026,11,19)
+        rec={'asof':'2026-11-18','quality':{'current_alerts_eligible':True},
+             'zones':[{'tf':'Monthly','date':'2025-01-01','d':100,'p':110,'achievement':1}]}
+        row={'amc':'1','scheme':'Example Large Cap Fund','scheme_id':'1',
+             'stock_isin':'INE000000001','weight_pct':0,
+             'qty':'0','previous_qty':'100','change_qty':'-100',
+             'change_type':'EXITED','period':'2026-10-31'}
+        out,_=m.ranking({'AAA':[row]}, {'AAA':rec},now)
+        self.assertEqual(out,[])  # no false zone stock when scheme sold entire stake
+
+    def test_weight_tiebreak_favors_more_portfolio_exposure_not_past_nav(self):
+        now=date(2026,11,19)
+        zone={'tf':'Quarterly','date':'2025-01-01','d':100,'p':110,'achievement':1}
+        rec={'asof':'2026-11-18','quality':{'current_alerts_eligible':True},'zones':[zone]}
+        def row(name,weight):
+            return {'amc':'1','scheme':name,'scheme_id':name,'qty':'100',
+                    'period':'2026-10-31','weight_pct':weight}
+        funds,_=m.ranking({'AAA':[row('Example Large Cap Fund',2.0),
+                                       row('Example Small Cap Fund',6.0)]},
+                          {'AAA':rec},now)
+        self.assertEqual(funds[0]['fund'],'Example Small Cap Fund')
+        self.assertEqual(funds[0]['zone_portfolio_weight_pct'],6.0)
+        self.assertEqual(funds[0]['zone_stocks'],1)
+
     def test_html_escapes_embedded_source(self):
         source = {'funds': [{'fund': '</script><script>alert(1)</script>',
                             'amc_id': '1', 'category': 'Large Cap'}],

@@ -279,32 +279,32 @@ td:nth-child(n+5){text-align:right}small{color:#506179}details{margin-top:7px}su
 <p><b>Research scope:</b> Nifty 500 stocks with market cap > ₹500 Cr and verified zone data.
 Fund-holdings counts only reflect this covered stock universe, NOT entire portfolio.
 Excludes ELSS, arbitrage, debt, liquid, hybrid and non-equity schemes. No guaranteed rally.</p>
-<input id="query" placeholder="Search fund" /><select id="category"><option value="">All categories</option></select>
+<input id="query" placeholder="Search fund" /><select id="top"><option value="0">All</option><option value="10">Top 10</option><option value="20">Top 20</option><option value="50">Top 50</option></select><select id="category"><option value="">All categories</option></select>
 <select id="amc"><option value="">All AMCs</option></select>
 <div style="overflow:auto"><table><thead><tr><th>#</th><th>Fund / zones</th><th>AMC ID</th><th>Category</th>
-<th>Demand</th><th>Verified / Covered</th><th>Demand %</th><th>Achievement</th><th>M/Q/HY</th></tr></thead>
+<th>Demand</th><th>Verified / Covered</th><th>Demand %</th><th>Weight %</th><th>Achievement</th><th>M/Q/HY</th><th>Month changes</th><th>Status</th></tr></thead>
 <tbody id="results"></tbody></table></div><p><small id="coverage"></small></p>
 <script>
 const data=__DATA__,funds=data.funds;
-const q=document.getElementById('query'),cat=document.getElementById('category'),
+const q=document.getElementById('query'),top=document.getElementById('top'),cat=document.getElementById('category'),
 amc=document.getElementById('amc'),body=document.getElementById('results');
 const esc=s=>String(s??'').replace(/[&<>"']/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));
 for(const v of [...new Set(funds.map(f=>f.category))].sort())cat.add(new Option(v,v));
 for(const v of [...new Set(funds.map(f=>f.amc_id))].sort())amc.add(new Option(v,v));
-document.getElementById('counts').textContent=data.generated_at+' | '+funds.length+' equity funds ranked';
+document.getElementById('counts').textContent=data.generated_at+' | '+funds.filter(f=>f.rank!==null).length+' provisional rankings; '+funds.filter(f=>f.rank===null).length+' withheld';
 document.getElementById('coverage').textContent='Stocks fetched: '+data.coverage.fetched+
 ' / '+data.coverage.candidates+'; partial data: '+data.coverage.partial+
 '. Fund holdings outside selected stock universe remain unknown.';
 function draw(){
-const rows=funds.filter(f=>(!cat.value||cat.value===f.category)&&(!amc.value||amc.value===f.amc_id)&&
+const rows=funds.filter(f=>(!top.value||+top.value===0||(f.rank!==null&&f.rank<=+top.value))&&(!cat.value||cat.value===f.category)&&(!amc.value||amc.value===f.amc_id)&&
 (!q.value||f.fund.toLowerCase().includes(q.value.toLowerCase())));
 body.innerHTML=rows.map(f=>'<tr><td>'+f.rank+'</td><td><b>'+esc(f.fund)+'</b><details><summary>Show stock zones</summary>'+
-f.stocks.map(p=>'<div>'+esc(p.stock)+' · '+p.zones.map(z=>esc(z.tf)+' '+z.d+'–'+z.p+' (achievement '+z.achievement+')').join(', ')+'</div>').join('')+
+f.stocks.map(p=>'<div>'+esc(p.stock)+' ('+esc(p.weight_pct??'unknown')+'% weight) · '+p.zones.map(z=>esc(z.tf)+' '+z.d+'–'+z.p+' (achievement '+z.achievement+')').join(', ')+'</div>').join('')+
 '</details></td><td>'+esc(f.amc_id)+'</td><td>'+esc(f.category)+'</td><td>'+f.zone_stocks+
 '</td><td>'+f.verified_holdings+' / '+f.holdings_in_scanned_universe+'</td><td>'+f.zone_pct_verified+
-'</td><td>'+f.achievement_stocks+'</td><td>'+f.monthly+'/'+f.quarterly+'/'+f.half_yearly+'</td></tr>').join('');
+'</td><td>'+esc(f.zone_portfolio_weight_pct??'unknown')+'</td><td>'+f.achievement_stocks+'</td><td>'+f.monthly+'/'+f.quarterly+'/'+f.half_yearly+'</td><td><details><summary>'+esc(Object.entries(f.month_changes||{}).map(([k,v])=>k+':'+v).join(', ')||'None')+'</summary>'+((f.month_change_details||[]).map(m=>'<div>'+esc(m.stock)+' · '+esc(m.kind)+' · '+esc(m.previous_qty)+' → '+esc(m.current_qty)+'</div>').join(''))+'</details></td><td>'+esc(f.rank_status)+'</td></tr>').join('');
 }
-q.oninput=draw;cat.onchange=draw;amc.onchange=draw;draw();
+q.oninput=draw;top.onchange=draw;cat.onchange=draw;amc.onchange=draw;draw();
 </script></body></html>""".replace('__DATA__',payload)
 
 def main():

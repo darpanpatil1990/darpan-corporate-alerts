@@ -10,7 +10,7 @@ from decimal import Decimal
 ROOT='https://www.nseindia.com'
 PIT='/api/corporates-pit-gg?index='
 SAST='/api/corporate-sast-reg29?'
-ARCHIVES={'nsearchives.nseindia.com','archives.nseindia.com'}
+ARCHIVES={'nsearchives.nseindia.com','archives.nseindia.com','nsearchives.nseindia.in'}
 FIELDS={
  'buyer':'NameOfThePerson','instrument':'TypeOfInstrument','category':'CategoryOfPerson',
  'action':'SecuritiesAcquiredOrDisposedTransactionType','qty':'SecuritiesAcquiredOrDisposedNumberOfSecurity',

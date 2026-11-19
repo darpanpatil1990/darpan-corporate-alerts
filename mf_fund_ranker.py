@@ -61,6 +61,7 @@ def decimal(value):
     return q
 
 def parse_page(data,isin,today):
+    """Read month-end quantities: increases are not verified exchange purchases."""
     if data.get('code')!=0 or data.get('headers')!=FIELDS:raise ValueError('ScanX holdings schema changed')
     result=[];identities=set()
     for vals in data.get('data',[]):
@@ -71,20 +72,33 @@ def parse_page(data,isin,today):
         dates=str(r['date']).split('|');quantities=str(r['shares']).split('|')
         weights=str(r['assetPerc']).split('|')
         if len(dates)!=len(quantities) or not dates:raise ValueError('Undated holding')
+        if len(weights)!=len(dates):raise ValueError('Allocation history does not match quantity dates')
         monthly={}
-        for i,(stamp,value) in enumerate(zip(dates,quantities)):
+        for stamp,value,weight in zip(dates,quantities,weights):
             q=decimal(value)
             if q<0:raise ValueError('Negative holding')
-            w=decimal(weights[i]) if i<len(weights) and str(weights[i]).strip() else None
+            w=decimal(weight) if str(weight).strip() else None
             if w is not None and not 0<=w<=100:raise ValueError('Allocation outside 0-100%')
             if stamp in monthly and monthly[stamp]!=(q,w):raise ValueError('Conflicting monthly holding')
             monthly[stamp]=(q,w)
-        current=max(monthly);period=last_day(current);qty,weight=monthly[current]
-        if not 0<=(today-period).days<=62 or qty==0:continue
+        periods=sorted(monthly,key=last_day)
+        current=periods[-1];period=last_day(current);qty,weight=monthly[current]
+        if not 0<=(today-period).days<=62:continue
+        previous=periods[-2] if len(periods)>1 else None
+        prior_qty=monthly[previous][0] if previous else None
+        if qty==0 and (prior_qty is None or prior_qty==0):continue
+        delta=(qty-prior_qty) if prior_qty is not None else None
+        trend=('NO_HISTORY' if delta is None else 'EXITED' if qty==0 else
+               'NEW_POSITION' if prior_qty==0 else 'INCREASED' if delta>0 else
+               'REDUCED' if delta<0 else 'UNCHANGED')
         result.append({'amc':str(r['amcid']),'scheme_id':str(r['planid']),
             'scheme':canonical(r['sch']),'qty':str(qty),
+            'previous_qty':str(prior_qty) if prior_qty is not None else None,
+            'change_qty':str(delta) if delta is not None else None,
+            'change_type':trend,'previous_period':last_day(previous).isoformat() if previous else None,
             'weight_pct':float(weight) if weight is not None else None,
-            'period':period.isoformat(),'stock_isin':isin})
+            'period':period.isoformat(),'stock_isin':isin,
+            'caveat':'Monthly disclosed quantity difference; not proof of a transaction or NFO status.'})
     return result,identities
 
 def get_json(endpoint,data=None):
@@ -147,6 +161,7 @@ def zone_info(stock,today):
             'zones':z if fresh else []}
 
 def ranking(source,stocks,today):
+    """Count distinct verified zone stocks first; never rank by past NAV returns."""
     grouped={};excluded=Counter()
     for symbol,items in source.items():
         for item in items:
@@ -155,7 +170,13 @@ def ranking(source,stocks,today):
                 excluded[reason]+=1;continue
             key=(item['amc'],item['scheme'].casefold())
             f=grouped.setdefault(key,{'fund':item['scheme'],'amc_id':item['amc'],
-                                      'category':group,'positions':{}})
+                                      'category':group,'positions':{},'activity':{}})
+            if item.get('change_type') not in (None,'NO_HISTORY','UNCHANGED'):
+                f['activity'][symbol]={'stock':symbol,'kind':item['change_type'],
+                    'previous_qty':item.get('previous_qty'),'current_qty':item['qty'],
+                    'change_qty':item.get('change_qty'),'asof':item['period'],
+                    'source':'ScanX monthly reported quantities; not a confirmed trade'}
+            if decimal(item.get('qty',1))<=0:continue   # exits are reported, never ranked as holdings
             pos=f['positions'].get(symbol)
             if pos and pos['period']>=item['period']:continue
             f['positions'][symbol]={**zone_info(stocks.get(symbol),today),
@@ -163,19 +184,27 @@ def ranking(source,stocks,today):
     out=[]
     for f in grouped.values():
         positions=list(f['positions'].values())
+        if not positions:continue   # full exits cannot masquerade as an active fund holding
         verified=[p for p in positions if p['verified']]
         hit=[p for p in verified if p['zones']]
         ach=[p for p in hit if any(isinstance(z['achievement'],(float,int)) and z['achievement']>=1 for z in p['zones'])]
         by_tf={x:sum(any(z['tf']==x for z in p['zones']) for p in hit) for x in TF}
+        weighted=[p['weight_pct'] for p in hit if p['weight_pct'] is not None]
+        changes=list(f['activity'].values())
+        change_counts=dict(Counter(row['kind'] for row in changes))
         out.append({'fund':f['fund'],'amc_id':f['amc_id'],'category':f['category'],
             'holdings_in_scanned_universe':len(positions),'verified_holdings':len(verified),
             'zone_stocks':len(hit),'achievement_stocks':len(ach),
             'zone_pct_verified':round(100*len(hit)/len(verified),2) if verified else None,
+            'zone_portfolio_weight_pct':round(sum(weighted),4) if len(weighted)==len(hit) else None,
+            'zone_weight_known_stocks':len(weighted),
             'monthly':by_tf['Monthly'],'quarterly':by_tf['Quarterly'],'half_yearly':by_tf['Half Yearly'],
             'latest_holdings_month':max(p['period'] for p in positions),
+            'month_changes':change_counts,'month_change_details':sorted(changes,key=lambda x:x['stock']),
+            'ranking_scope':'PROVISIONAL: verified eligible Nifty 500 positions only, full portfolio not verified',
             'stocks':sorted(hit,key=lambda x:x['stock'])})
-    out.sort(key=lambda x:(-x['zone_stocks'],-x['achievement_stocks'],
-             -(x['zone_pct_verified'] or 0),x['fund'].casefold()))
+    out.sort(key=lambda x:(-x['zone_stocks'],-(x['zone_portfolio_weight_pct'] or 0),
+             -x['achievement_stocks'],-(x['zone_pct_verified'] or 0),x['fund'].casefold()))
     for i,row in enumerate(out,1):row['rank']=i
     return out,dict(excluded)
 

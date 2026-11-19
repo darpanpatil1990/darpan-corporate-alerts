@@ -127,6 +127,44 @@ class MutualFundRankerTests(unittest.TestCase):
         self.assertEqual(funds[0]['zone_portfolio_weight_pct'],6.0)
         self.assertEqual(funds[0]['zone_stocks'],1)
 
+
+    def test_catalogue_new_listing_not_claimed_to_be_verified_nfo(self):
+        now=date(2026,11,19)
+        base={'code':0,'data':[{'amcid':'5','scheme':[
+            {'planid':'1','sch':'Example Large Cap Fund'}]}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            cache=Path(tmp)
+            first=m.catalogue_changes(base,cache,now)
+            self.assertTrue(first['baseline_created'])
+            self.assertEqual(first['new_provider_listings'],[])
+            later={'code':0,'data':[{'amcid':'5','scheme':[
+                {'planid':'1','sch':'Example Large Cap Fund'},
+                {'planid':'2','sch':'New Example Mid Cap Fund'}]}]}
+            update=m.catalogue_changes(later,cache,now)
+            self.assertEqual(len(update['new_provider_listings']),1)
+            self.assertEqual(update['new_provider_listings'][0]['fund'],'New Example Mid Cap Fund')
+            self.assertIn('Not confirmed NFO',update['new_listing_caveat'])
+
+    def test_provider_catalogue_error_does_not_wipe_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache=Path(tmp)
+            m.catalogue_changes({'code':0,'data':[{'amcid':'3','scheme':['ABC Large Cap Fund']}]},
+                                cache,date(2026,11,19))
+            before=(cache/'catalogue.json').read_bytes()
+            with self.assertRaises(ValueError):
+                m.catalogue_changes({'code':500,'data':[]},cache,date(2026,11,19))
+            self.assertEqual((cache/'catalogue.json').read_bytes(),before)
+
+    def test_stale_funds_rank_withheld_not_zero_achievement_claim(self):
+        row={'amc':'1','scheme':'Example Large Cap Fund','scheme_id':'1',
+             'qty':'100','weight_pct':3.5,'period':'2026-10-31'}
+        rec={'asof':'2026-01-01','quality':{'current_alerts_eligible':True},
+             'zones':[{'tf':'Monthly','date':'2025-01-01','d':100,'p':110,'achievement':2}]}
+        out,_=m.ranking({'AAA':[row]},{'AAA':rec},date(2026,11,19))
+        self.assertEqual(len(out),1)
+        self.assertIsNone(out[0]['rank'])
+        self.assertTrue(out[0]['rank_status'].startswith('WITHHELD'))
+
     def test_html_escapes_embedded_source(self):
         source = {'funds': [{'fund': '</script><script>alert(1)</script>',
                             'amc_id': '1', 'category': 'Large Cap'}],

@@ -61,6 +61,7 @@ def decimal(value):
     return q
 
 def parse_page(data,isin,today):
+    """Read month-end quantities: increases are not verified exchange purchases."""
     if data.get('code')!=0 or data.get('headers')!=FIELDS:raise ValueError('ScanX holdings schema changed')
     result=[];identities=set()
     for vals in data.get('data',[]):
@@ -71,20 +72,33 @@ def parse_page(data,isin,today):
         dates=str(r['date']).split('|');quantities=str(r['shares']).split('|')
         weights=str(r['assetPerc']).split('|')
         if len(dates)!=len(quantities) or not dates:raise ValueError('Undated holding')
+        if len(weights)!=len(dates):raise ValueError('Allocation history does not match quantity dates')
         monthly={}
-        for i,(stamp,value) in enumerate(zip(dates,quantities)):
+        for stamp,value,weight in zip(dates,quantities,weights):
             q=decimal(value)
             if q<0:raise ValueError('Negative holding')
-            w=decimal(weights[i]) if i<len(weights) and str(weights[i]).strip() else None
+            w=decimal(weight) if str(weight).strip() else None
             if w is not None and not 0<=w<=100:raise ValueError('Allocation outside 0-100%')
             if stamp in monthly and monthly[stamp]!=(q,w):raise ValueError('Conflicting monthly holding')
             monthly[stamp]=(q,w)
-        current=max(monthly);period=last_day(current);qty,weight=monthly[current]
-        if not 0<=(today-period).days<=62 or qty==0:continue
+        periods=sorted(monthly,key=last_day)
+        current=periods[-1];period=last_day(current);qty,weight=monthly[current]
+        if not 0<=(today-period).days<=62:continue
+        previous=periods[-2] if len(periods)>1 else None
+        prior_qty=monthly[previous][0] if previous else None
+        if qty==0 and (prior_qty is None or prior_qty==0):continue
+        delta=(qty-prior_qty) if prior_qty is not None else None
+        trend=('NO_HISTORY' if delta is None else 'EXITED' if qty==0 else
+               'NEW_POSITION' if prior_qty==0 else 'INCREASED' if delta>0 else
+               'REDUCED' if delta<0 else 'UNCHANGED')
         result.append({'amc':str(r['amcid']),'scheme_id':str(r['planid']),
             'scheme':canonical(r['sch']),'qty':str(qty),
+            'previous_qty':str(prior_qty) if prior_qty is not None else None,
+            'change_qty':str(delta) if delta is not None else None,
+            'change_type':trend,'previous_period':last_day(previous).isoformat() if previous else None,
             'weight_pct':float(weight) if weight is not None else None,
-            'period':period.isoformat(),'stock_isin':isin})
+            'period':period.isoformat(),'stock_isin':isin,
+            'caveat':'Monthly disclosed quantity difference; not proof of a transaction or NFO status.'})
     return result,identities
 
 def get_json(endpoint,data=None):
@@ -123,6 +137,58 @@ def holdings(isin,today,cache):
     target.write_bytes(gzip.compress(json.dumps(rows,separators=(',',':')).encode()))
     return rows
 
+
+def catalogue_changes(catalogue, cache_dir, today):
+    """Detect newly listed provider entries, NOT verified NFO launch dates.
+
+    The first run establishes a baseline. Any absence/invalid provider response must
+    not erase the prior catalogue. Catalogue keys never contribute to fund scores.
+    """
+    if catalogue.get('code')!=0 or not isinstance(catalogue.get('data'),list):
+        raise ValueError('AMC catalogue unavailable')
+    entries={};amc_count=0;unknown=0
+    for amc in catalogue['data']:
+        if not isinstance(amc,dict):raise ValueError('Invalid AMC catalogue row')
+        amcid=str(amc.get('amcid') or amc.get('id') or '').strip()
+        if not amcid:unknown+=1;continue
+        amc_count+=1
+        schemes=amc.get('scheme',[])
+        if not isinstance(schemes,list):raise ValueError('Invalid scheme catalogue')
+        for sch in schemes:
+            if isinstance(sch,str):name=canonical(sch);sid=name.casefold()
+            elif isinstance(sch,dict):
+                name=canonical(sch.get('sch') or sch.get('name') or
+                               sch.get('schemeName') or '')
+                sid=str(sch.get('planid') or sch.get('schemeid') or
+                        sch.get('id') or name.casefold())
+            else:
+                unknown+=1;continue
+            if not name or not sid:unknown+=1;continue
+            key=amcid+':'+sid
+            if key in entries and entries[key]['fund']!=name:
+                raise ValueError('Conflicting catalogue entries')
+            entries[key]={'amc_id':amcid,'fund':name,'type':category(name)[0]}
+    if not entries:raise ValueError('AMC catalogue contains no identifiable schemes')
+    cache_dir.mkdir(parents=True,exist_ok=True)
+    file=cache_dir/'catalogue.json'
+    previous=None
+    if file.exists():
+        old=json.loads(file.read_text())
+        if isinstance(old,dict) and isinstance(old.get('entries'),dict):
+            previous=old['entries']
+    new=[entries[key] for key in sorted(set(entries)-set(previous or {}))] if previous is not None else []
+    status={'source':AMCS,'checked_at':today.isoformat(),'amcs_identified':amc_count,
+        'schemes_identified':len(entries),'unknown_rows':unknown,
+        'baseline_created':previous is None,
+        'new_provider_listings':new,
+        'new_listing_caveat':'New to the ScanX catalogue since last verified snapshot. Not confirmed NFOs; launch status and dates require official AMC/AMFI verification.',
+        'catalogue_completeness_confirmed':unknown==0}
+    # Atomic snapshot update after successful parsing.
+    tmp=file.with_suffix('.tmp')
+    tmp.write_text(json.dumps({'checked_at':today.isoformat(),'entries':entries},separators=(',',':')))
+    tmp.replace(file)
+    return status
+
 def read_state(file):
     state=json.loads(Path(file).read_text())
     if state.get('encoding') in ('xz-base64','gzip-base64'):
@@ -147,6 +213,7 @@ def zone_info(stock,today):
             'zones':z if fresh else []}
 
 def ranking(source,stocks,today):
+    """Count distinct verified zone stocks first; never rank by past NAV returns."""
     grouped={};excluded=Counter()
     for symbol,items in source.items():
         for item in items:
@@ -155,7 +222,13 @@ def ranking(source,stocks,today):
                 excluded[reason]+=1;continue
             key=(item['amc'],item['scheme'].casefold())
             f=grouped.setdefault(key,{'fund':item['scheme'],'amc_id':item['amc'],
-                                      'category':group,'positions':{}})
+                                      'category':group,'positions':{},'activity':{}})
+            if item.get('change_type') not in (None,'NO_HISTORY','UNCHANGED'):
+                f['activity'][symbol]={'stock':symbol,'kind':item['change_type'],
+                    'previous_qty':item.get('previous_qty'),'current_qty':item['qty'],
+                    'change_qty':item.get('change_qty'),'asof':item['period'],
+                    'source':'ScanX monthly reported quantities; not a confirmed trade'}
+            if decimal(item.get('qty',1))<=0:continue   # exits are reported, never ranked as holdings
             pos=f['positions'].get(symbol)
             if pos and pos['period']>=item['period']:continue
             f['positions'][symbol]={**zone_info(stocks.get(symbol),today),
@@ -163,20 +236,36 @@ def ranking(source,stocks,today):
     out=[]
     for f in grouped.values():
         positions=list(f['positions'].values())
+        if not positions:continue   # full exits cannot masquerade as an active fund holding
         verified=[p for p in positions if p['verified']]
         hit=[p for p in verified if p['zones']]
         ach=[p for p in hit if any(isinstance(z['achievement'],(float,int)) and z['achievement']>=1 for z in p['zones'])]
         by_tf={x:sum(any(z['tf']==x for z in p['zones']) for p in hit) for x in TF}
+        weighted=[p['weight_pct'] for p in hit if p['weight_pct'] is not None]
+        changes=list(f['activity'].values())
+        change_counts=dict(Counter(row['kind'] for row in changes))
         out.append({'fund':f['fund'],'amc_id':f['amc_id'],'category':f['category'],
             'holdings_in_scanned_universe':len(positions),'verified_holdings':len(verified),
             'zone_stocks':len(hit),'achievement_stocks':len(ach),
             'zone_pct_verified':round(100*len(hit)/len(verified),2) if verified else None,
+            'zone_portfolio_weight_pct':round(sum(weighted),4) if len(weighted)==len(hit) else None,
+            'zone_weight_known_stocks':len(weighted),
             'monthly':by_tf['Monthly'],'quarterly':by_tf['Quarterly'],'half_yearly':by_tf['Half Yearly'],
             'latest_holdings_month':max(p['period'] for p in positions),
+            'month_changes':change_counts,'month_change_details':sorted(changes,key=lambda x:x['stock']),
+            'ranking_scope':'PROVISIONAL: verified eligible Nifty 500 positions only, full portfolio not verified',
             'stocks':sorted(hit,key=lambda x:x['stock'])})
-    out.sort(key=lambda x:(-x['zone_stocks'],-x['achievement_stocks'],
-             -(x['zone_pct_verified'] or 0),x['fund'].casefold()))
-    for i,row in enumerate(out,1):row['rank']=i
+    out.sort(key=lambda x:(-x['zone_stocks'],-(x['zone_portfolio_weight_pct'] or 0),
+             -x['achievement_stocks'],-(x['zone_pct_verified'] or 0),x['fund'].casefold()))
+    ordinal=0
+    for row in out:
+        if row['verified_holdings']==0:
+            row['rank']=None
+            row['rank_status']='WITHHELD: no fresh verified stock-zone observations'
+        else:
+            ordinal+=1
+            row['rank']=ordinal
+            row['rank_status']='PROVISIONAL: missing full-fund universe coverage'
     return out,dict(excluded)
 
 def html_dashboard(report):
@@ -190,32 +279,32 @@ td:nth-child(n+5){text-align:right}small{color:#506179}details{margin-top:7px}su
 <p><b>Research scope:</b> Nifty 500 stocks with market cap > ₹500 Cr and verified zone data.
 Fund-holdings counts only reflect this covered stock universe, NOT entire portfolio.
 Excludes ELSS, arbitrage, debt, liquid, hybrid and non-equity schemes. No guaranteed rally.</p>
-<input id="query" placeholder="Search fund" /><select id="category"><option value="">All categories</option></select>
+<input id="query" placeholder="Search fund" /><select id="top"><option value="0">All</option><option value="10">Top 10</option><option value="20">Top 20</option><option value="50">Top 50</option></select><select id="category"><option value="">All categories</option></select>
 <select id="amc"><option value="">All AMCs</option></select>
 <div style="overflow:auto"><table><thead><tr><th>#</th><th>Fund / zones</th><th>AMC ID</th><th>Category</th>
-<th>Demand</th><th>Verified / Covered</th><th>Demand %</th><th>Achievement</th><th>M/Q/HY</th></tr></thead>
+<th>Demand</th><th>Verified / Covered</th><th>Demand %</th><th>Weight %</th><th>Achievement</th><th>M/Q/HY</th><th>Month changes</th><th>Status</th></tr></thead>
 <tbody id="results"></tbody></table></div><p><small id="coverage"></small></p>
 <script>
 const data=__DATA__,funds=data.funds;
-const q=document.getElementById('query'),cat=document.getElementById('category'),
+const q=document.getElementById('query'),top=document.getElementById('top'),cat=document.getElementById('category'),
 amc=document.getElementById('amc'),body=document.getElementById('results');
 const esc=s=>String(s??'').replace(/[&<>"']/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));
 for(const v of [...new Set(funds.map(f=>f.category))].sort())cat.add(new Option(v,v));
 for(const v of [...new Set(funds.map(f=>f.amc_id))].sort())amc.add(new Option(v,v));
-document.getElementById('counts').textContent=data.generated_at+' | '+funds.length+' equity funds ranked';
+document.getElementById('counts').textContent=data.generated_at+' | '+funds.filter(f=>f.rank!==null).length+' provisional rankings; '+funds.filter(f=>f.rank===null).length+' withheld';
 document.getElementById('coverage').textContent='Stocks fetched: '+data.coverage.fetched+
 ' / '+data.coverage.candidates+'; partial data: '+data.coverage.partial+
 '. Fund holdings outside selected stock universe remain unknown.';
 function draw(){
-const rows=funds.filter(f=>(!cat.value||cat.value===f.category)&&(!amc.value||amc.value===f.amc_id)&&
+const rows=funds.filter(f=>(!top.value||+top.value===0||(f.rank!==null&&f.rank<=+top.value))&&(!cat.value||cat.value===f.category)&&(!amc.value||amc.value===f.amc_id)&&
 (!q.value||f.fund.toLowerCase().includes(q.value.toLowerCase())));
 body.innerHTML=rows.map(f=>'<tr><td>'+f.rank+'</td><td><b>'+esc(f.fund)+'</b><details><summary>Show stock zones</summary>'+
-f.stocks.map(p=>'<div>'+esc(p.stock)+' · '+p.zones.map(z=>esc(z.tf)+' '+z.d+'–'+z.p+' (achievement '+z.achievement+')').join(', ')+'</div>').join('')+
+f.stocks.map(p=>'<div>'+esc(p.stock)+' ('+esc(p.weight_pct??'unknown')+'% weight) · '+p.zones.map(z=>esc(z.tf)+' '+z.d+'–'+z.p+' (achievement '+z.achievement+')').join(', ')+'</div>').join('')+
 '</details></td><td>'+esc(f.amc_id)+'</td><td>'+esc(f.category)+'</td><td>'+f.zone_stocks+
 '</td><td>'+f.verified_holdings+' / '+f.holdings_in_scanned_universe+'</td><td>'+f.zone_pct_verified+
-'</td><td>'+f.achievement_stocks+'</td><td>'+f.monthly+'/'+f.quarterly+'/'+f.half_yearly+'</td></tr>').join('');
+'</td><td>'+esc(f.zone_portfolio_weight_pct??'unknown')+'</td><td>'+f.achievement_stocks+'</td><td>'+f.monthly+'/'+f.quarterly+'/'+f.half_yearly+'</td><td><details><summary>'+esc(Object.entries(f.month_changes||{}).map(([k,v])=>k+':'+v).join(', ')||'None')+'</summary>'+((f.month_change_details||[]).map(m=>'<div>'+esc(m.stock)+' · '+esc(m.kind)+' · '+esc(m.previous_qty)+' → '+esc(m.current_qty)+'</div>').join(''))+'</details></td><td>'+esc(f.rank_status)+'</td></tr>').join('');
 }
-q.oninput=draw;cat.onchange=draw;amc.onchange=draw;draw();
+q.oninput=draw;top.onchange=draw;cat.onchange=draw;amc.onchange=draw;draw();
 </script></body></html>""".replace('__DATA__',payload)
 
 def main():
@@ -259,21 +348,23 @@ def main():
               'mf_source':API,'amc_source':AMCS}
     try:
         cat=get_json(AMCS)
-        if cat.get('code')!=0 or not isinstance(cat.get('data'),list):
-            raise ValueError('AMC catalogue unavailable')
-        coverage['provider_amc_count']=len(cat['data'])
-        coverage['provider_scheme_count']=sum(len(x.get('scheme',[])) for x in cat['data'])
+        catalogue=catalogue_changes(cat,Path('.scanner-cache/mf-ranker'),today)
+        coverage['provider_amc_count']=catalogue['amcs_identified']
+        coverage['provider_scheme_count']=catalogue['schemes_identified']
+        coverage['catalogue']=catalogue
+        if not catalogue['catalogue_completeness_confirmed']:coverage['partial']=True
     except Exception as e:
-        coverage['amc_error']=str(e)[:150];coverage['partial']=True
+        coverage['amc_error']=type(e).__name__+': '+str(e)[:150]
+        coverage['partial']=True
     report={'generated_at':datetime.now(IST).isoformat(),
-            'ranking':'Highest distinct demand-zone stocks first; achievement is tie-breaker',
+            'ranking':'RESEARCH ONLY: distinct verified demand-zone stocks, then confirmed weightage, achievement; never trailing fund returns or age',
             'coverage':coverage,'excluded_rows':excluded,'funds':funds}
     out=Path(a.output);out.mkdir(parents=True,exist_ok=True)
     (out/'ranking.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
     (out/'dashboard.html').write_text(html_dashboard(report),encoding='utf-8')
     cols=['rank','fund','amc_id','category','zone_stocks','verified_holdings',
-          'holdings_in_scanned_universe','zone_pct_verified','achievement_stocks',
-          'monthly','quarterly','half_yearly','latest_holdings_month']
+          'holdings_in_scanned_universe','zone_pct_verified','zone_portfolio_weight_pct','achievement_stocks',
+          'monthly','quarterly','half_yearly','latest_holdings_month','rank_status']
     with (out/'ranking.csv').open('w',newline='',encoding='utf-8-sig') as f:
         writer=csv.DictWriter(f,fieldnames=cols,extrasaction='ignore')
         writer.writeheader();writer.writerows(funds)

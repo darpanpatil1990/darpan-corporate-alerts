@@ -137,6 +137,58 @@ def holdings(isin,today,cache):
     target.write_bytes(gzip.compress(json.dumps(rows,separators=(',',':')).encode()))
     return rows
 
+
+def catalogue_changes(catalogue, cache_dir, today):
+    """Detect newly listed provider entries, NOT verified NFO launch dates.
+
+    The first run establishes a baseline. Any absence/invalid provider response must
+    not erase the prior catalogue. Catalogue keys never contribute to fund scores.
+    """
+    if catalogue.get('code')!=0 or not isinstance(catalogue.get('data'),list):
+        raise ValueError('AMC catalogue unavailable')
+    entries={};amc_count=0;unknown=0
+    for amc in catalogue['data']:
+        if not isinstance(amc,dict):raise ValueError('Invalid AMC catalogue row')
+        amcid=str(amc.get('amcid') or amc.get('id') or '').strip()
+        if not amcid:unknown+=1;continue
+        amc_count+=1
+        schemes=amc.get('scheme',[])
+        if not isinstance(schemes,list):raise ValueError('Invalid scheme catalogue')
+        for sch in schemes:
+            if isinstance(sch,str):name=canonical(sch);sid=name.casefold()
+            elif isinstance(sch,dict):
+                name=canonical(sch.get('sch') or sch.get('name') or
+                               sch.get('schemeName') or '')
+                sid=str(sch.get('planid') or sch.get('schemeid') or
+                        sch.get('id') or name.casefold())
+            else:
+                unknown+=1;continue
+            if not name or not sid:unknown+=1;continue
+            key=amcid+':'+sid
+            if key in entries and entries[key]['fund']!=name:
+                raise ValueError('Conflicting catalogue entries')
+            entries[key]={'amc_id':amcid,'fund':name,'type':category(name)[0]}
+    if not entries:raise ValueError('AMC catalogue contains no identifiable schemes')
+    cache_dir.mkdir(parents=True,exist_ok=True)
+    file=cache_dir/'catalogue.json'
+    previous=None
+    if file.exists():
+        old=json.loads(file.read_text())
+        if isinstance(old,dict) and isinstance(old.get('entries'),dict):
+            previous=old['entries']
+    new=[entries[key] for key in sorted(set(entries)-set(previous or {}))] if previous is not None else []
+    status={'source':AMCS,'checked_at':today.isoformat(),'amcs_identified':amc_count,
+        'schemes_identified':len(entries),'unknown_rows':unknown,
+        'baseline_created':previous is None,
+        'new_provider_listings':new,
+        'new_listing_caveat':'New to the ScanX catalogue since last verified snapshot. Not confirmed NFOs; launch status and dates require official AMC/AMFI verification.',
+        'catalogue_completeness_confirmed':unknown==0}
+    # Atomic snapshot update after successful parsing.
+    tmp=file.with_suffix('.tmp')
+    tmp.write_text(json.dumps({'checked_at':today.isoformat(),'entries':entries},separators=(',',':')))
+    tmp.replace(file)
+    return status
+
 def read_state(file):
     state=json.loads(Path(file).read_text())
     if state.get('encoding') in ('xz-base64','gzip-base64'):
@@ -205,7 +257,15 @@ def ranking(source,stocks,today):
             'stocks':sorted(hit,key=lambda x:x['stock'])})
     out.sort(key=lambda x:(-x['zone_stocks'],-(x['zone_portfolio_weight_pct'] or 0),
              -x['achievement_stocks'],-(x['zone_pct_verified'] or 0),x['fund'].casefold()))
-    for i,row in enumerate(out,1):row['rank']=i
+    ordinal=0
+    for row in out:
+        if row['verified_holdings']==0:
+            row['rank']=None
+            row['rank_status']='WITHHELD: no fresh verified stock-zone observations'
+        else:
+            ordinal+=1
+            row['rank']=ordinal
+            row['rank_status']='PROVISIONAL: missing full-fund universe coverage'
     return out,dict(excluded)
 
 def html_dashboard(report):
@@ -288,21 +348,23 @@ def main():
               'mf_source':API,'amc_source':AMCS}
     try:
         cat=get_json(AMCS)
-        if cat.get('code')!=0 or not isinstance(cat.get('data'),list):
-            raise ValueError('AMC catalogue unavailable')
-        coverage['provider_amc_count']=len(cat['data'])
-        coverage['provider_scheme_count']=sum(len(x.get('scheme',[])) for x in cat['data'])
+        catalogue=catalogue_changes(cat,Path('.scanner-cache/mf-ranker'),today)
+        coverage['provider_amc_count']=catalogue['amcs_identified']
+        coverage['provider_scheme_count']=catalogue['schemes_identified']
+        coverage['catalogue']=catalogue
+        if not catalogue['catalogue_completeness_confirmed']:coverage['partial']=True
     except Exception as e:
-        coverage['amc_error']=str(e)[:150];coverage['partial']=True
+        coverage['amc_error']=type(e).__name__+': '+str(e)[:150]
+        coverage['partial']=True
     report={'generated_at':datetime.now(IST).isoformat(),
-            'ranking':'Highest distinct demand-zone stocks first; achievement is tie-breaker',
+            'ranking':'RESEARCH ONLY: distinct verified demand-zone stocks, then confirmed weightage, achievement; never trailing fund returns or age',
             'coverage':coverage,'excluded_rows':excluded,'funds':funds}
     out=Path(a.output);out.mkdir(parents=True,exist_ok=True)
     (out/'ranking.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
     (out/'dashboard.html').write_text(html_dashboard(report),encoding='utf-8')
     cols=['rank','fund','amc_id','category','zone_stocks','verified_holdings',
-          'holdings_in_scanned_universe','zone_pct_verified','achievement_stocks',
-          'monthly','quarterly','half_yearly','latest_holdings_month']
+          'holdings_in_scanned_universe','zone_pct_verified','zone_portfolio_weight_pct','achievement_stocks',
+          'monthly','quarterly','half_yearly','latest_holdings_month','rank_status']
     with (out/'ranking.csv').open('w',newline='',encoding='utf-8-sig') as f:
         writer=csv.DictWriter(f,fieldnames=cols,extrasaction='ignore')
         writer.writeheader();writer.writerows(funds)

@@ -38,10 +38,12 @@ class MutualFundRankerTests(unittest.TestCase):
         self.assertEqual(rows[0]['weight_pct'], 4.5)
         self.assertEqual(len(identities), 1)
 
-    def test_zero_current_quantity_does_not_count(self):
+    def test_zero_current_quantity_recorded_as_exit_not_current_holding(self):
         rows, _ = m.parse_page(sample(shares='0|0|100'), 'INE000000001',
                                date(2026, 11, 19))
-        self.assertEqual(rows, [])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['change_type'], 'EXITED')
+        self.assertEqual(rows[0]['qty'], '0')
 
     def test_stale_month_is_not_current_holding(self):
         rows, _ = m.parse_page(sample(), 'INE000000001', date(2027, 2, 19))

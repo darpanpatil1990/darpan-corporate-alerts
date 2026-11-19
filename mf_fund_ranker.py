@@ -78,11 +78,12 @@ def parse_page(data,isin,today):
             q=decimal(value)
             if q<0:raise ValueError('Negative holding')
             w=decimal(weight) if str(weight).strip() else None
-            if w is not None and not 0<=w<=100:raise ValueError('Allocation outside 0-100%')
-            if stamp in monthly and monthly[stamp]!=(q,w):raise ValueError('Conflicting monthly holding')
-            monthly[stamp]=(q,w)
+            issue='WEIGHT_OUT_OF_RANGE' if w is not None and not 0<=w<=100 else None
+            if issue:w=None  # Quarantine the weight, NOT the independently verified share quantity.
+            if stamp in monthly and monthly[stamp]!=(q,w,issue):raise ValueError('Conflicting monthly holding')
+            monthly[stamp]=(q,w,issue)
         periods=sorted(monthly,key=last_day)
-        current=periods[-1];period=last_day(current);qty,weight=monthly[current]
+        current=periods[-1];period=last_day(current);qty,weight,weight_issue=monthly[current]
         if not 0<=(today-period).days<=62:continue
         previous=periods[-2] if len(periods)>1 else None
         prior_qty=monthly[previous][0] if previous else None
@@ -97,6 +98,7 @@ def parse_page(data,isin,today):
             'change_qty':str(delta) if delta is not None else None,
             'change_type':trend,'previous_period':last_day(previous).isoformat() if previous else None,
             'weight_pct':float(weight) if weight is not None else None,
+            'weight_issue':weight_issue,
             'period':period.isoformat(),'stock_isin':isin,
             'caveat':'Monthly disclosed quantity difference; not proof of a transaction or NFO status.'})
     return result,identities
@@ -232,7 +234,8 @@ def ranking(source,stocks,today):
             pos=f['positions'].get(symbol)
             if pos and pos['period']>=item['period']:continue
             f['positions'][symbol]={**zone_info(stocks.get(symbol),today),
-                'stock':symbol,'weight_pct':item['weight_pct'],'period':item['period']}
+                'stock':symbol,'weight_pct':item['weight_pct'],
+                'weight_issue':item.get('weight_issue'),'period':item['period']}
     out=[]
     for f in grouped.values():
         positions=list(f['positions'].values())
@@ -250,6 +253,7 @@ def ranking(source,stocks,today):
             'zone_pct_verified':round(100*len(hit)/len(verified),2) if verified else None,
             'zone_portfolio_weight_pct':round(sum(weighted),4) if len(weighted)==len(hit) else None,
             'zone_weight_known_stocks':len(weighted),
+            'invalid_weight_positions':sum(bool(p.get('weight_issue')) for p in positions),
             'monthly':by_tf['Monthly'],'quarterly':by_tf['Quarterly'],'half_yearly':by_tf['Half Yearly'],
             'latest_holdings_month':max(p['period'] for p in positions),
             'month_changes':change_counts,'month_change_details':sorted(changes,key=lambda x:x['stock']),
@@ -340,12 +344,17 @@ def main():
                 errors[symbol]=type(e).__name__+': '+str(e)[:150]
                 print('UNAVAILABLE',symbol,errors[symbol],flush=True)
     funds,excluded=ranking(found,stocks,today)
+    weight_issues=[{'stock':symbol,'fund':item['scheme'],'reason':item['weight_issue']}
+                   for symbol,rows in found.items() for item in rows if item.get('weight_issue')]
     coverage={'universe':'Nifty 500 with market cap > INR 500 Cr',
               'official_membership_asof':snapshot.get('verified_at'),
               'candidates':len(candidates),'fetched':len(found),'errors':errors,
               'partial':bool(errors or len(stocks)<len(members) or a.limit),
               'scope':'Holdings outside this tracked stock universe are unknown, not zero.',
-              'mf_source':API,'amc_source':AMCS}
+              'mf_source':API,'amc_source':AMCS,
+              'invalid_weight_rows':len(weight_issues),
+              'weight_issues_preview':weight_issues[:50],
+              'weight_coverage_caveat':'Out-of-range provider allocation is excluded from weight scores; verified quantity and zone count retained.'}
     try:
         cat=get_json(AMCS)
         catalogue=catalogue_changes(cat,Path('.scanner-cache/mf-ranker'),today)

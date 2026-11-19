@@ -153,25 +153,40 @@ class MutualFundRankerTests(unittest.TestCase):
 
     def test_catalogue_new_listing_not_claimed_to_be_verified_nfo(self):
         now=date(2026,11,19)
-        base={'code':0,'data':[{'amcid':'5','scheme':[
-            {'planid':'1','sch':'Example Large Cap Fund'}]}]}
+        base={'code':0,'data':[{'amc_id':5,'amc':'Example Mutual Fund','scheme':[
+            {'plan_id':'1','name':'Example Large Cap Fund Direct-Growth'}]}]}
         with tempfile.TemporaryDirectory() as tmp:
             cache=Path(tmp)
             first=m.catalogue_changes(base,cache,now)
             self.assertTrue(first['baseline_created'])
             self.assertEqual(first['new_provider_listings'],[])
-            later={'code':0,'data':[{'amcid':'5','scheme':[
-                {'planid':'1','sch':'Example Large Cap Fund'},
-                {'planid':'2','sch':'New Example Mid Cap Fund'}]}]}
+            later={'code':0,'data':[{'amc_id':5,'amc':'Example Mutual Fund','scheme':[
+                {'plan_id':'1','name':'Example Large Cap Fund Direct-Growth'},
+                {'plan_id':'3','name':'Example Large Cap Fund Regular-Growth'},
+                {'plan_id':'2','name':'New Example Mid Cap Fund Direct-Growth'}]}]}
             update=m.catalogue_changes(later,cache,now)
             self.assertEqual(len(update['new_provider_listings']),1)
             self.assertEqual(update['new_provider_listings'][0]['fund'],'New Example Mid Cap Fund')
             self.assertIn('Not confirmed NFO',update['new_listing_caveat'])
 
+    def test_scanx_catalogue_schema_deduplicates_plans(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            catalogue={'code':0,'data':[{'amc_id':41331,'amc':'360 ONE Mutual Fund',
+                'scheme':[{'plan_id':'28458','name':'360 ONE Focused Fund Direct-Growth'},
+                          {'plan_id':'28459','name':'360 ONE Focused Fund Regular-Growth'},
+                          {'plan_id':'28460','name':'360 ONE Arbitrage Fund Direct-Growth'}]}]}
+            result=m.catalogue_changes(catalogue,Path(tmp),date(2026,11,19))
+            self.assertEqual(result['amcs_identified'],1)
+            self.assertEqual(result['schemes_identified'],2)
+            self.assertEqual(result['eligible_equity_schemes'],1)
+            self.assertEqual(result['unknown_rows'],0)
+            self.assertTrue(result['catalogue_completeness_confirmed'])
+            self.assertTrue(result['baseline_created'])
+
     def test_provider_catalogue_error_does_not_wipe_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache=Path(tmp)
-            m.catalogue_changes({'code':0,'data':[{'amcid':'3','scheme':['ABC Large Cap Fund']}]},
+            m.catalogue_changes({'code':0,'data':[{'amc_id':3,'amc':'ABC MF','scheme':[{'plan_id':'1','name':'ABC Large Cap Fund'}]}]},
                                 cache,date(2026,11,19))
             before=(cache/'catalogue.json').read_bytes()
             with self.assertRaises(ValueError):

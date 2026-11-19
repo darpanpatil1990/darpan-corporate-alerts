@@ -214,6 +214,15 @@ class NseAcquisitionTests(unittest.TestCase):
   def cached(folder,key,ttl,loader):calls.append(key);return parsed
   events,status=n.load('Insider',{'TEST':'INE000000001'},s.day('2026-10-24'),fetch,cached)
   self.assertEqual(status['selected_filings'],1);self.assertEqual(status['superseded_filings'],1);self.assertEqual(len(calls),1);self.assertEqual(len(events),1)
+ def test_nse_archive_official_in_host_and_untrusted_rejection(self):
+  import exchange_disclosures as n
+  self.assertEqual(n.archive_link('https://nsearchives.nseindia.in/corporate/xbrl/test.xml',True),
+                   'https://nsearchives.nseindia.in/corporate/xbrl/test.xml')
+  for invalid in ('http://nsearchives.nseindia.in/corporate/test.xml',
+                  'https://nsearchives.nseindia.in.evil.example/corporate/test.xml',
+                  'https://nsearchives.nseindia.in/other/test.xml',
+                  'https://nsearchives.nseindia.in/corporate/test.xml?redirect=1'):
+   with self.assertRaises(ValueError):n.archive_link(invalid,True)
  def test_sast_actual_date_and_mode_are_validated(self):
   import exchange_disclosures as n
   row={'symbol':'TEST','acqSaleType':'Acquisition','acquisitionMode':'Open Market','acqType':'Equity shares','acquirerDate':'20-OCT-2026 to 21-OCT-2026','sysTime':'23-Oct-2026 17:05','noOfShareAcq':'1,000','attachement':'https://nsearchives.nseindia.com/corporate/test.zip','acquirerName':'Disclosed Buyer','application_no':'1','promoterType':'Y'}

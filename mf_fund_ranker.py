@@ -141,35 +141,39 @@ def holdings(isin,today,cache):
 
 
 def catalogue_changes(catalogue, cache_dir, today):
-    """Detect newly listed provider entries, NOT verified NFO launch dates.
+    """Track fund names in ScanX catalogue; never infer an official NFO date.
 
-    The first run establishes a baseline. Any absence/invalid provider response must
-    not erase the prior catalogue. Catalogue keys never contribute to fund scores.
+    ScanX amclist_v2 supplies amc_id, amc, scheme[] with plan_id and name.
+    A scheme's direct/regular plans are ONE fund, not separate NFO launches.
     """
     if catalogue.get('code')!=0 or not isinstance(catalogue.get('data'),list):
         raise ValueError('AMC catalogue unavailable')
-    entries={};amc_count=0;unknown=0
+    entries={};amcs=set();unknown=0
     for amc in catalogue['data']:
         if not isinstance(amc,dict):raise ValueError('Invalid AMC catalogue row')
-        amcid=str(amc.get('amcid') or amc.get('id') or '').strip()
-        if not amcid:unknown+=1;continue
-        amc_count+=1
-        schemes=amc.get('scheme',[])
-        if not isinstance(schemes,list):raise ValueError('Invalid scheme catalogue')
+        amcid=str(amc.get('amc_id') or '').strip()
+        amc_name=str(amc.get('amc') or '').strip()
+        if not amcid or not amc_name:
+            unknown+=1;continue
+        amcs.add(amcid)
+        schemes=amc.get('scheme')
+        if not isinstance(schemes,list):
+            unknown+=1;continue
         for sch in schemes:
-            if isinstance(sch,str):name=canonical(sch);sid=name.casefold()
-            elif isinstance(sch,dict):
-                name=canonical(sch.get('sch') or sch.get('name') or
-                               sch.get('schemeName') or '')
-                sid=str(sch.get('planid') or sch.get('schemeid') or
-                        sch.get('id') or name.casefold())
-            else:
+            if not isinstance(sch,dict):
                 unknown+=1;continue
-            if not name or not sid:unknown+=1;continue
-            key=amcid+':'+sid
-            if key in entries and entries[key]['fund']!=name:
-                raise ValueError('Conflicting catalogue entries')
-            entries[key]={'amc_id':amcid,'fund':name,'type':category(name)[0]}
+            name=canonical(sch.get('name') or '')
+            planid=str(sch.get('plan_id') or '').strip()
+            if not name or not planid:
+                unknown+=1;continue
+            key=amcid+':'+name.casefold()
+            if key not in entries:
+                category_name,excluded=category(name)
+                entries[key]={'amc_id':amcid,'amc':amc_name,
+                    'fund':name,'category':category_name,
+                    'excluded_reason':excluded,'plan_ids':[planid]}
+            elif planid not in entries[key]['plan_ids']:
+                entries[key]['plan_ids'].append(planid)
     if not entries:raise ValueError('AMC catalogue contains no identifiable schemes')
     cache_dir.mkdir(parents=True,exist_ok=True)
     file=cache_dir/'catalogue.json'
@@ -178,18 +182,22 @@ def catalogue_changes(catalogue, cache_dir, today):
         old=json.loads(file.read_text())
         if isinstance(old,dict) and isinstance(old.get('entries'),dict):
             previous=old['entries']
-    new=[entries[key] for key in sorted(set(entries)-set(previous or {}))] if previous is not None else []
-    status={'source':AMCS,'checked_at':today.isoformat(),'amcs_identified':amc_count,
-        'schemes_identified':len(entries),'unknown_rows':unknown,
-        'baseline_created':previous is None,
-        'new_provider_listings':new,
-        'new_listing_caveat':'New to the ScanX catalogue since last verified snapshot. Not confirmed NFOs; launch status and dates require official AMC/AMFI verification.',
+    additions=sorted(set(entries)-set(previous or {})) if previous is not None else []
+    additions=[entries[key] for key in additions]
+    eligible_additions=[dict(x) for x in additions if x['category'] is not None]
+    status={'source':AMCS,'checked_at':today.isoformat(),
+        'amcs_identified':len(amcs),'schemes_identified':len(entries),
+        'eligible_equity_schemes':sum(bool(x['category']) for x in entries.values()),
+        'unknown_rows':unknown,'baseline_created':previous is None,
+        'new_provider_listings':eligible_additions,
+        'all_new_scheme_listings':len(additions),
+        'new_listing_caveat':'First seen in ScanX catalogue, not a confirmed NFO; official AMC/AMFI launch dates must be verified.',
         'catalogue_completeness_confirmed':unknown==0}
-    # Atomic snapshot update after successful parsing.
     tmp=file.with_suffix('.tmp')
     tmp.write_text(json.dumps({'checked_at':today.isoformat(),'entries':entries},separators=(',',':')))
     tmp.replace(file)
     return status
+
 
 def read_state(file):
     state=json.loads(Path(file).read_text())
@@ -357,13 +365,6 @@ def main():
               'weight_coverage_caveat':'Out-of-range provider allocation is excluded from weight scores; verified quantity and zone count retained.'}
     try:
         cat=get_json(AMCS)
-        if isinstance(cat,dict):
-            samples=(cat.get('data') or [])[:2] if isinstance(cat.get('data'),list) else []
-            print('AMC CATALOGUE SCHEMA',
-                json.dumps({'root_keys':list(cat),'data_type':type(cat.get('data')).__name__,
-                    'sample_record_types':[type(x).__name__ for x in samples],
-                    'sample_keys':[list(x) if isinstance(x,dict) else [] for x in samples],
-                    'sample_records':[str(x)[:250] for x in samples]},ensure_ascii=False),flush=True)
         catalogue=catalogue_changes(cat,Path('.scanner-cache/mf-ranker'),today)
         coverage['provider_amc_count']=catalogue['amcs_identified']
         coverage['provider_scheme_count']=catalogue['schemes_identified']

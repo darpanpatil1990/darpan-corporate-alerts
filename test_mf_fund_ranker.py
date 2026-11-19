@@ -38,6 +38,27 @@ class MutualFundRankerTests(unittest.TestCase):
         self.assertEqual(rows[0]['weight_pct'], 4.5)
         self.assertEqual(len(identities), 1)
 
+
+    def test_out_of_range_weight_is_quarantined_but_share_qty_preserved(self):
+        data=sample(weights='150|150|4.0')
+        rows,ids=m.parse_page(data,'INE000000001',date(2026,11,19))
+        self.assertEqual(len(ids),1)
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]['qty'],'120')
+        self.assertIsNone(rows[0]['weight_pct'])
+        self.assertEqual(rows[0]['weight_issue'],'WEIGHT_OUT_OF_RANGE')
+
+    def test_out_of_range_weight_never_inflates_fund_weight_score(self):
+        now=date(2026,11,19)
+        z={'tf':'Monthly','date':'2025-01-01','d':100,'p':110,'achievement':1}
+        stock={'asof':'2026-11-18','quality':{'current_alerts_eligible':True},'zones':[z]}
+        row={'amc':'1','scheme':'Example Large Cap Fund','scheme_id':'1','qty':'120',
+             'period':'2026-10-31','weight_pct':None,'weight_issue':'WEIGHT_OUT_OF_RANGE'}
+        funds,_=m.ranking({'AAA':[row]},{'AAA':stock},now)
+        self.assertEqual(funds[0]['zone_stocks'],1)
+        self.assertIsNone(funds[0]['zone_portfolio_weight_pct'])
+        self.assertEqual(funds[0]['invalid_weight_positions'],1)
+
     def test_zero_current_quantity_recorded_as_exit_not_current_holding(self):
         rows, _ = m.parse_page(sample(shares='0|0|100'), 'INE000000001',
                                date(2026, 11, 19))

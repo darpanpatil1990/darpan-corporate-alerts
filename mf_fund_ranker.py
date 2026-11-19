@@ -357,8 +357,10 @@ def main():
     coverage={'universe':'Nifty 500 with market cap > INR 500 Cr',
               'official_membership_asof':snapshot.get('verified_at'),
               'candidates':len(candidates),'fetched':len(found),'errors':errors,
-              'partial':bool(errors or len(stocks)<len(members) or a.limit),
-              'scope':'Holdings outside this tracked stock universe are unknown, not zero.',
+              'tracked_universe_complete':not bool(errors or a.limit),
+              'full_fund_portfolios_verified':False,
+              'partial':True,
+              'scope':'All eligible tracked Nifty 500 stocks may be scanned, but fund positions outside this universe remain unknown. Every ranking is provisional.',
               'mf_source':API,'amc_source':AMCS,
               'invalid_weight_rows':len(weight_issues),
               'weight_issues_preview':weight_issues[:50],
@@ -391,9 +393,12 @@ def main():
         with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
             f.write('## MF Demand Zone Fund Ranking\n\nFunds ranked: '+str(len(funds))+
                 '; stocks checked: '+str(len(found))+'/'+str(len(candidates))+
-                '; partial coverage: '+str(coverage['partial'])+
-                '. Counts reflect covered Nifty-500 stock universe, not entire fund portfolios.\n')
-    if coverage['partial']:
-        raise SystemExit('Rankings saved with partial data warning; source/stock gaps above.')
+                '; tracked universe complete: '+str(coverage['tracked_universe_complete'])+
+                '; full portfolio coverage: NOT VERIFIED. Results are provisional and are not return rankings.\n')
+    # A successful workflow confirms the configured 500-stock scan and AMC catalogue,
+    # NEVER complete scheme-level holdings across the Indian market.
+    if not coverage['tracked_universe_complete'] or not coverage.get('catalogue',{}).get('catalogue_completeness_confirmed',False):
+        raise SystemExit('Provider/stock verification incomplete; provisional rankings saved, not certified full fund rankings.')
+    print('TRACKED UNIVERSE COMPLETE; FUND-LEVEL COVERAGE PROVISIONAL',flush=True)
 
 if __name__=='__main__':main()

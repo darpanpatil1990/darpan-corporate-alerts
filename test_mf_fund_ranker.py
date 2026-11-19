@@ -167,7 +167,7 @@ class MutualFundRankerTests(unittest.TestCase):
             update=m.catalogue_changes(later,cache,now)
             self.assertEqual(len(update['new_provider_listings']),1)
             self.assertEqual(update['new_provider_listings'][0]['fund'],'New Example Mid Cap Fund')
-            self.assertIn('Not confirmed NFO',update['new_listing_caveat'])
+            self.assertIn('not a confirmed nfo',update['new_listing_caveat'].casefold())
 
     def test_scanx_catalogue_schema_deduplicates_plans(self):
         with tempfile.TemporaryDirectory() as tmp:

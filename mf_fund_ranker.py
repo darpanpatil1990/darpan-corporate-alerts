@@ -357,6 +357,13 @@ def main():
               'weight_coverage_caveat':'Out-of-range provider allocation is excluded from weight scores; verified quantity and zone count retained.'}
     try:
         cat=get_json(AMCS)
+        if isinstance(cat,dict):
+            samples=(cat.get('data') or [])[:2] if isinstance(cat.get('data'),list) else []
+            print('AMC CATALOGUE SCHEMA',
+                json.dumps({'root_keys':list(cat),'data_type':type(cat.get('data')).__name__,
+                    'sample_record_types':[type(x).__name__ for x in samples],
+                    'sample_keys':[list(x) if isinstance(x,dict) else [] for x in samples],
+                    'sample_records':[str(x)[:250] for x in samples]},ensure_ascii=False),flush=True)
         catalogue=catalogue_changes(cat,Path('.scanner-cache/mf-ranker'),today)
         coverage['provider_amc_count']=catalogue['amcs_identified']
         coverage['provider_scheme_count']=catalogue['schemes_identified']

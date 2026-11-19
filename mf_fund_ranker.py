@@ -15,7 +15,7 @@ IST=ZoneInfo('Asia/Kolkata')
 API='https://ow-static-scanx.dhan.co/staticscanx/mfpastholdingsbyisin'
 AMCS='https://ow-static-scanx.dhan.co/staticscanx/amclist_v2'
 FIELDS=['amcid','sch','planid','isin','shares','assetPerc','onemonthSharesCh','onemonthCh','threemonthCh','date','seo']
-TF={'Monthly','Quarterly','Half Yearly'}
+TF={'Monthly','Quarterly'}
 EXCLUDE=[
  (r'\belss\b|tax[\s-]*(?:saving|saver|shield)|80c','ELSS'),
  (r'\barbitrage\b','Arbitrage'),
@@ -252,6 +252,8 @@ def ranking(source,stocks,today):
         hit=[p for p in verified if p['zones']]
         ach=[p for p in hit if any(isinstance(z['achievement'],(float,int)) and z['achievement']>=1 for z in p['zones'])]
         by_tf={x:sum(any(z['tf']==x for z in p['zones']) for p in hit) for x in TF}
+        ach_by_tf={x:sum(any(z['tf']==x and isinstance(z['achievement'],(float,int))
+                            and z['achievement']>=1 for z in p['zones']) for p in hit) for x in TF}
         weighted=[p['weight_pct'] for p in hit if p['weight_pct'] is not None]
         changes=list(f['activity'].values())
         change_counts=dict(Counter(row['kind'] for row in changes))
@@ -262,13 +264,17 @@ def ranking(source,stocks,today):
             'zone_portfolio_weight_pct':round(sum(weighted),4) if len(weighted)==len(hit) else None,
             'zone_weight_known_stocks':len(weighted),
             'invalid_weight_positions':sum(bool(p.get('weight_issue')) for p in positions),
-            'monthly':by_tf['Monthly'],'quarterly':by_tf['Quarterly'],'half_yearly':by_tf['Half Yearly'],
+            'monthly':by_tf['Monthly'],'quarterly':by_tf['Quarterly'],
+            'monthly_achievement':ach_by_tf['Monthly'],'quarterly_achievement':ach_by_tf['Quarterly'],
             'latest_holdings_month':max(p['period'] for p in positions),
             'month_changes':change_counts,'month_change_details':sorted(changes,key=lambda x:x['stock']),
             'ranking_scope':'PROVISIONAL: verified eligible Nifty 500 positions only, full portfolio not verified',
             'stocks':sorted(hit,key=lambda x:x['stock'])})
-    out.sort(key=lambda x:(-x['zone_stocks'],-(x['zone_portfolio_weight_pct'] or 0),
-             -x['achievement_stocks'],-(x['zone_pct_verified'] or 0),x['fund'].casefold()))
+    # Monthly/Quarterly demand and achieved zones determine ranking before exposure.
+    # The same stock is counted once across the two timeframes.
+    out.sort(key=lambda x:(-x['zone_stocks'],-x['achievement_stocks'],
+             -(x['zone_portfolio_weight_pct'] or 0),
+             -(x['zone_pct_verified'] or 0),x['fund'].casefold()))
     ordinal=0
     for row in out:
         if row['verified_holdings']==0:
@@ -283,18 +289,18 @@ def ranking(source,stocks,today):
 def html_dashboard(report):
     payload=json.dumps(report,ensure_ascii=False).replace('<','\\u003c')
     return """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MF Demand Zone Fund Ranking</title><style>body{font:15px system-ui;background:#f6f8fc;color:#15223b;margin:24px}
+<title>MF Monthly & Quarterly Demand + Achievement Ranking</title><style>body{font:15px system-ui;background:#f6f8fc;color:#15223b;margin:24px}
 table{width:100%;border-collapse:collapse;background:white}td,th{padding:10px;border-bottom:1px solid #e2e8f0;text-align:left}
 th{background:#eaf0f9}select,input{padding:10px;margin:7px;border:1px solid #cbd5e1;border-radius:7px}
 td:nth-child(n+5){text-align:right}small{color:#506179}details{margin-top:7px}summary{cursor:pointer;color:#075cad}
-</style></head><body><h2>Mutual Fund · HTF Demand Ranking</h2><p id="counts"></p>
+</style></head><body><h2>Mutual Fund · Monthly / Quarterly Demand + Achievement Ranking</h2><p id="counts"></p>
 <p><b>Research scope:</b> Nifty 500 stocks with market cap > ₹500 Cr and verified zone data.
 Fund-holdings counts only reflect this covered stock universe, NOT entire portfolio.
 Excludes ELSS, arbitrage, debt, liquid, hybrid and non-equity schemes. No guaranteed rally.</p>
 <input id="query" placeholder="Search fund" /><select id="top"><option value="0">All</option><option value="10">Top 10</option><option value="20">Top 20</option><option value="50">Top 50</option></select><select id="category"><option value="">All categories</option></select>
 <select id="amc"><option value="">All AMCs</option></select>
 <div style="overflow:auto"><table><thead><tr><th>#</th><th>Fund / zones</th><th>AMC ID</th><th>Category</th>
-<th>Demand</th><th>Verified / Covered</th><th>Demand %</th><th>Weight %</th><th>Achievement</th><th>M/Q/HY</th><th>Month changes</th><th>Status</th></tr></thead>
+<th>Demand</th><th>Verified / Covered</th><th>Demand %</th><th>Weight %</th><th>Achievement</th><th>M/Q demand</th><th>M/Q achievement</th><th>Month changes</th><th>Status</th></tr></thead>
 <tbody id="results"></tbody></table></div><p><small id="coverage"></small></p>
 <script>
 const data=__DATA__,funds=data.funds;
@@ -314,7 +320,7 @@ body.innerHTML=rows.map(f=>'<tr><td>'+f.rank+'</td><td><b>'+esc(f.fund)+'</b><de
 f.stocks.map(p=>'<div>'+esc(p.stock)+' ('+esc(p.weight_pct??'unknown')+'% weight) · '+p.zones.map(z=>esc(z.tf)+' '+z.d+'–'+z.p+' (achievement '+z.achievement+')').join(', ')+'</div>').join('')+
 '</details></td><td>'+esc(f.amc_id)+'</td><td>'+esc(f.category)+'</td><td>'+f.zone_stocks+
 '</td><td>'+f.verified_holdings+' / '+f.holdings_in_scanned_universe+'</td><td>'+f.zone_pct_verified+
-'</td><td>'+esc(f.zone_portfolio_weight_pct??'unknown')+'</td><td>'+f.achievement_stocks+'</td><td>'+f.monthly+'/'+f.quarterly+'/'+f.half_yearly+'</td><td><details><summary>'+esc(Object.entries(f.month_changes||{}).map(([k,v])=>k+':'+v).join(', ')||'None')+'</summary>'+((f.month_change_details||[]).map(m=>'<div>'+esc(m.stock)+' · '+esc(m.kind)+' · '+esc(m.previous_qty)+' → '+esc(m.current_qty)+'</div>').join(''))+'</details></td><td>'+esc(f.rank_status)+'</td></tr>').join('');
+'</td><td>'+esc(f.zone_portfolio_weight_pct??'unknown')+'</td><td>'+f.achievement_stocks+'</td><td>'+f.monthly+'/'+f.quarterly+'</td><td>'+f.monthly_achievement+'/'+f.quarterly_achievement+'</td><td><details><summary>'+esc(Object.entries(f.month_changes||{}).map(([k,v])=>k+':'+v).join(', ')||'None')+'</summary>'+((f.month_change_details||[]).map(m=>'<div>'+esc(m.stock)+' · '+esc(m.kind)+' · '+esc(m.previous_qty)+' → '+esc(m.current_qty)+'</div>').join(''))+'</details></td><td>'+esc(f.rank_status)+'</td></tr>').join('');
 }
 q.oninput=draw;top.onchange=draw;cat.onchange=draw;amc.onchange=draw;draw();
 </script></body></html>""".replace('__DATA__',payload)
@@ -376,14 +382,14 @@ def main():
         coverage['amc_error']=type(e).__name__+': '+str(e)[:150]
         coverage['partial']=True
     report={'generated_at':datetime.now(IST).isoformat(),
-            'ranking':'RESEARCH ONLY: distinct verified demand-zone stocks, then confirmed weightage, achievement; never trailing fund returns or age',
+            'ranking':'RESEARCH ONLY: Monthly/Quarterly demand-zone stock count, Monthly/Quarterly achievement count, then verified portfolio exposure; never trailing fund returns, rating or age',
             'coverage':coverage,'excluded_rows':excluded,'funds':funds}
     out=Path(a.output);out.mkdir(parents=True,exist_ok=True)
     (out/'ranking.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
     (out/'dashboard.html').write_text(html_dashboard(report),encoding='utf-8')
     cols=['rank','fund','amc_id','category','zone_stocks','verified_holdings',
           'holdings_in_scanned_universe','zone_pct_verified','zone_portfolio_weight_pct','achievement_stocks',
-          'monthly','quarterly','half_yearly','latest_holdings_month','rank_status']
+          'monthly','quarterly','monthly_achievement','quarterly_achievement','latest_holdings_month','rank_status']
     with (out/'ranking.csv').open('w',newline='',encoding='utf-8-sig') as f:
         writer=csv.DictWriter(f,fieldnames=cols,extrasaction='ignore')
         writer.writeheader();writer.writerows(funds)

@@ -91,12 +91,42 @@ class MutualFundRankerTests(unittest.TestCase):
                   'BBB': stock(z('Half Yearly', 0))}
         funds, excluded = m.ranking(holdings, stocks, today)
         self.assertEqual(len(funds), 1)
-        self.assertEqual(funds[0]['zone_stocks'], 2)
+        self.assertEqual(funds[0]['zone_stocks'], 1)
         self.assertEqual(funds[0]['achievement_stocks'], 1)
-        self.assertEqual((funds[0]['monthly'], funds[0]['quarterly'],
-                          funds[0]['half_yearly']), (1, 1, 1))
-        self.assertEqual(funds[0]['zone_pct_verified'], 100)
+        self.assertEqual((funds[0]['monthly'], funds[0]['quarterly']), (1, 1))
+        self.assertEqual((funds[0]['monthly_achievement'], funds[0]['quarterly_achievement']), (1, 1))
+        self.assertNotIn('half_yearly', funds[0])
+        self.assertEqual(funds[0]['zone_pct_verified'], 50)
         self.assertEqual(excluded, {})
+
+    def test_monthly_quarterly_only_excludes_half_yearly_achievement(self):
+        rec={'asof':'2026-11-18','quality':{'current_alerts_eligible':True},
+             'zones':[{'tf':'Half Yearly','date':'2025-01-01','d':100,'p':110,'achievement':3},
+                      {'tf':'Monthly','date':'2025-01-01','d':100,'p':110,'achievement':0},
+                      {'tf':'Quarterly','date':'2025-01-01','d':100,'p':110,'achievement':1}]}
+        zones=m.zone_info(rec,date(2026,11,19))['zones']
+        self.assertEqual({z['tf'] for z in zones},{'Monthly','Quarterly'})
+        record={'amc':'1','scheme':'Example Large Cap Fund','qty':'100','weight_pct':3,
+                'period':'2026-10-31'}
+        funds,_=m.ranking({'AAA':[record]},{'AAA':rec},date(2026,11,19))
+        self.assertEqual(funds[0]['zone_stocks'],1)
+        self.assertEqual(funds[0]['achievement_stocks'],1)
+        self.assertEqual(funds[0]['monthly_achievement'],0)
+        self.assertEqual(funds[0]['quarterly_achievement'],1)
+
+    def test_achievements_rank_before_weight_when_mq_demand_count_ties(self):
+        now=date(2026,11,19)
+        rec={'asof':'2026-11-18','quality':{'current_alerts_eligible':True},
+             'zones':[{'tf':'Monthly','date':'2025-01-01','d':100,'p':110,'achievement':0}]}
+        achieved={'asof':'2026-11-18','quality':{'current_alerts_eligible':True},
+                  'zones':[{'tf':'Quarterly','date':'2025-01-01','d':100,'p':110,'achievement':2}]}
+        high={'amc':'1','scheme':'Example Large Cap Fund','qty':'100',
+              'period':'2026-10-31','weight_pct':15}
+        low={'amc':'1','scheme':'Example Small Cap Fund','qty':'100',
+             'period':'2026-10-31','weight_pct':1}
+        funds,_=m.ranking({'AAA':[high],'BBB':[low]},{'AAA':rec,'BBB':achieved},now)
+        self.assertEqual(funds[0]['fund'],'Example Small Cap Fund')
+        self.assertEqual(funds[0]['achievement_stocks'],1)
 
     def test_stale_quote_does_not_create_fake_zone_match(self):
         rec = {'asof': '2026-10-01',

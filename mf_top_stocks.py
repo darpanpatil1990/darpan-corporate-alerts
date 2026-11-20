@@ -45,7 +45,15 @@ def classify(cmp, zones, close_confirmed):
 
 def eligible_deals(record, quote_asof):
     out = []
-    for e in record.get("evidence", []):
+    # Scanner evidence stores dated acquisitions inside {zone, evidence:[...]}.
+    # A flat legacy evidence item is also accepted; never invent a deal date.
+    sources = []
+    for group in record.get("evidence", []):
+        if isinstance(group, dict) and isinstance(group.get("evidence"), list):
+            sources.extend(x for x in group["evidence"] if isinstance(x, dict))
+        elif isinstance(group, dict):
+            sources.append(group)
+    for e in sources:
         kind = str(e.get("kind", ""))
         buyer = str(e.get("buyer", ""))
         if not (kind.startswith("Bulk disclosed acquisition") or kind.startswith("Block disclosed acquisition")):
@@ -54,6 +62,11 @@ def eligible_deals(record, quote_asof):
             continue
         dt = str(e.get("end", ""))
         if not dt or dt > quote_asof[:10] or not e.get("source"):
+            continue
+        try:
+            if (date.fromisoformat(quote_asof[:10]) - date.fromisoformat(dt)).days > 45:
+                continue
+        except ValueError:
             continue
         out.append({"buyer": buyer, "kind": kind, "date": dt, "source": e["source"]})
     return sorted(out, key=lambda r: r["date"], reverse=True)[:8]

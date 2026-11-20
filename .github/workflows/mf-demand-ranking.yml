@@ -4,7 +4,9 @@ on:
     branches: [main]
     paths:
       - 'mf_fund_ranker.py'
+      - 'mf_top_stocks.py'
       - 'test_mf_fund_ranker.py'
+      - 'test_mf_top_stocks.py'
       - '.github/workflows/mf-demand-ranking.yml'
   workflow_dispatch:
   schedule:
@@ -13,7 +15,9 @@ on:
   pull_request:
     paths:
       - 'mf_fund_ranker.py'
+      - 'mf_top_stocks.py'
       - 'test_mf_fund_ranker.py'
+      - 'test_mf_top_stocks.py'
       - '.github/workflows/mf-demand-ranking.yml'
 permissions:
   contents: read
@@ -27,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Validate category filters and ranking logic
-        run: python -m unittest -v test_mf_fund_ranker.py
+        run: python -m unittest -v test_mf_fund_ranker.py test_mf_top_stocks.py
   rank:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event_name == 'push'
     needs: tests
@@ -45,6 +49,14 @@ jobs:
           restore-keys: mf-ranker-${{ runner.os }}-
       - name: Rank all ScanX equity schemes excluding ELSS, arbitrage and defensive funds
         run: python mf_fund_ranker.py --workers 4 --output mf-ranking-output
+      - name: Add Top 10 / Top 20 AMC buying segment to dashboard
+        if: success() || failure()
+        run: |
+          if [ -f mf-ranking-output/ranking.json ] && [ -f mf-ranking-output/dashboard.html ]; then
+            python mf_top_stocks.py --ranking mf-ranking-output/ranking.json --output mf-ranking-output
+          else
+            echo "No ranked report produced; nothing to append (not a successful dashboard refresh)."
+          fi
       - name: Upload research results even if coverage is partial
         if: always()
         uses: actions/upload-artifact@v4
